@@ -1,0 +1,1576 @@
+---
+title: "Toxoplasma in Coastal California Cats"
+author: "Ian Hoppe"
+date: "`r format( Sys.Date(), '%B %d, %Y' )`"
+output:
+  bookdown::html_document2:
+    theme: cosmo
+    highlight: tango
+    number_sections: FALSE
+    toc: TRUE
+    toc_float: TRUE
+bibliography: [ refs.bib, pkgs.bib ]
+link-citations: TRUE
+csl: journal-of-wildlife-diseases.csl
+---
+
+```{r pkgR, echo = FALSE, message = FALSE, warning = FALSE}
+
+## Load required packages and initialize bibliography.
+
+library( tidyverse )
+library( lubridate )
+library( broom )
+library( cowplot )
+# library( MCMCglmm )
+library( lme4 )
+library( optimx )
+library( influence.ME )
+library( MuMIn )
+library( knitr )
+library( MASS )
+
+knitr::write_bib( x = c( "lme4", "MuMIn", "base", "MASS", "lmerTest", "influence.ME", "optimx" ), 
+                  file = "pkgs.bib" )
+
+```
+
+```{r initializR, echo = FALSE, message = FALSE, warning = FALSE}
+
+## Prepare data for analysis.
+
+# Read in the raw data.
+cats <- read.csv( file = "data/coastalCAcats.csv", 
+                  header = TRUE, 
+                  sep = "," )
+
+# Consider only complete observations of feral (vs. wild) cats.
+cats.complete <- cats[ complete.cases( cats ), ]
+cats.complete <- cats.complete %>% 
+  filter( type == "managed" ) %>% 
+  dplyr::select( -type )
+
+
+# Teach R to recognize dates.
+cats.complete$date <- mdy( cats.complete$date )
+
+# Derive a variable for Julian date.
+cats.complete$Jday <- yday( x = cats.complete$date )
+
+# Homogenize titer levels.
+cats.complete$toxo.titer <- gsub( pattern = "<40", 
+                                  replacement = "20", 
+                                  x = cats.complete$toxo.titer )
+cats.complete$toxo.titer <- gsub( pattern = "[^0-9]", 
+                                  replacement = "", 
+                                  x = cats.complete$toxo.titer )
+
+# Correct likely errors in data entry. (Reviewed with E. VanWormer)
+cats.complete$toxo.titer[ which( cats.complete$toxo.titer == "5180" ) ] <- "5120"
+cats.complete$toxo.titer[ which( cats.complete$toxo.titer == "20240" ) ] <- "10240"
+
+# Convert titers to numeric values.
+cats.complete$toxo.titer <- as.numeric( cats.complete$toxo.titer )
+
+# Correct infection-positive responses for different titer levels.
+cats.complete$toxo40 <- ifelse( test = cats.complete$toxo.titer >= 40, 
+                                yes = 1, 
+                                no = 0 )
+cats.complete$toxo160 <- ifelse( test = cats.complete$toxo.titer >= 160, 
+                                 yes = 1, 
+                                 no = 0 )
+cats.complete$toxo320 <- ifelse( test = cats.complete$toxo.titer >= 320, 
+                                 yes = 1, 
+                                 no = 0 )
+
+# Order age covariates.
+cats.complete$age <- factor( x = cats.complete$age, 
+                             levels = c( "< 6 months", "6-12 months", "> 12 months" ), 
+                             ordered = TRUE )
+
+cats.complete$age.2 <- factor( x = cats.complete$age.2, 
+                               levels = c( "juvenile", "adult" ), 
+                               ordered = TRUE )
+
+# Data transformations
+cats.complete$otoxo.titer <- as.ordered( cats.complete$toxo.titer )
+cats.complete$fcolony <- as.factor( cats.complete$colony )
+
+# Extract subset of data for which clinical infection (as measured by toxo titer) has been established.
+cats.infect <- cats.complete[ which( as.logical( cats.complete$toxo160 ) ), ]
+
+# Determine whether transformation of the response might be useful; transform if needed.
+bc <- boxcox( toxo.titer ~ Jday + season + age + fiv + felv + sex, data = cats.infect, plotit = FALSE )
+l_est <- bc$x[ which.max( bc$y ) ]
+cats.infect$ttoxo.titer <- ifelse( test = rep( l_est != 0, length( cats.infect$toxo.titer ) ), 
+                                   yes = cats.infect$toxo.titer^l_est, 
+                                   no = log( cats.infect$toxo.titer ) )
+
+# Extract colony size data for summarization.
+cats.colonies <- cats.complete %>% 
+  dplyr::select( contains( "colony" ), -colony ) %>% 
+  distinct()
+
+```
+
+###**I N T R O D U C T I O N** {#intro}
+
+Though the protozoan parasite *Toxoplasma gondii* is capable of infecting many species of terrestrial endothermic vertebrates, its definitive hosts (and the only host known to shed infectious oocysts) are felids. *Toxoplasma* infection in cats is frequently asymptomatic, and diagnosis in the absence of clinical signs can prove difficult [@lappin1989, @merck9, @elmore2010]. Ideally, acute infection can be determined by the presence of oocysts passed in the feces. However, animals with a history of infection may not actively shed infectious particles (though repeat shedding has been reported; @elmore2010). The precise causes of variation in oocyst shedding remain unclear (but see @vanWormer2013).
+
+The detection of anti-*T. gondii* antibodies in blood serum presents an alternative means of diagnosing toxoplasmosis, but is not itself uncomplicated. Immunoglobulin M (IgM) antibodies accompany acute infection, but their detection presents difficulties similar to those affecting diagnosis on the basis of oocyst shedding. IgG antibodies persist in the bloodstream and are more easily detected in sera. However, the presence of elevated anti-*T. gondii* IgG antibodies in the blood is not necessarily indicative of recent infection [@merck9, @elmore2010, @vanWormer2013]. Instead, a positive diagnosis on the basis of IgG requires paired samples revealing a fourfold increase in titer [@merck9, @elmore2010; E. VanWormer, pers. comm.].
+
+Seeking to understand the causes of variation in IgG antibody levels, I used a mixed-effects modelling framework to analyze serologic data from a population of feral domestic cats inhabiting the central Caliornia coast. These cats were sampled as part of a trap-neuter-return program, with serologic screening and fecal analysis performed by VanWormer and colleagues [-@vanWormer2013] for a previous investigation of *Toxoplasma* oocyst shedding among feral and wild felids.
+
+```{r notR, echo = FALSE, message = FALSE, warning = FALSE, eval = FALSE}
+# --immunosuppression consequent to fiv/felv infection may increase susceptibility to toxo infection [@svobodová1998]
+```
+
+###**M E T H O D S** {#methods}
+
+####*Data*
+
+Blood and fecal samples were collected from feral domestic cats and wild felids inhabiting coastal regions around Monterey Bay, California, USA as reported previously by VanWormer and colleagues [-@vanWormer2013]. Samples were identified by both the individual and the colony from which they were collected. No individuals were sampled more than once. Feral domestic cats from 'managed' colonies were sampled as part of a trap-neuter-return program, and wild cats and felids (from 'depredated' colonies) were captured and euthanized by government land managers from protected bird breeding grounds. Only samples from managed colonies of feral domestic cats were considered in this analysis, as hosts sampled from depredated colonies were relatively few in number (*N* = `r sum(cats$type=="dep")`) and experienced different environmental conditions (unassessed) relative to the cats from managed colonies, which were sampled from more urban and peri-urban areas (E. VanWormer, pers. comm.).
+
+VanWormer and colleagues [-@vanWormer2013] tested blood sera for immunoglobulin G (IgG) anti-*T. gondii* antibodies using an indirect fluorescent antibody test (IFAT). Clinical diagnosis of toxoplasmosis on the basis of serologic IgG assays can be difficult due to issues related to the sensitivity and specificity of assays, but serum titers ≥1:160 are generally understood to indicate a history of infection (@dabritz2007; @vanWormer2013; E. VanWormer, pers. comm.). Positive results can occur at lower titers (*e.g.*, 1:40), but such results may reflect cross-reactivity with similar antibodies. Cats were also tested for exposure to feline immunodeficiency virus (FIV) and feline leukemia virus (FeLV) using a combined enzyme-linked immunosorbent assay (ELISA) test. While only the FeLV test detects viral antigens (indicating active infection) exposure to FIV typically results in persistent infection of the host [@merck9]. See Table \@ref(tab:vaRs) in the [Appendix](#appendix) for an explanation of the covariates included in the dataset.
+
+Antibody titer is a somewhat contrived metric assessing a continuous latent physiological variable, immune response. Titers are typically reported as the end titer (or its reciprocal) of a serial two-fold dilution of blood sera, yielding discrete values following a skewed distribution. Accordingly, I performed a Box-Cox transformation on the response, estimating $\lambda$ from a global linear model of titer using the `MASS` package for R [@R-base, @R-MASS]. The maximum likelihood estimate for $\lambda$ was `r round(l_est,2)`, suggesting that a log-transformation be used.
+
+####*Statistical analysis*
+
+To understand patterns of infection and variation in the strength of immune response to *Toxoplasma* infection among feral cats, I used a (generalized) linear mixed-effects framework to model infection status and titer, with `colony` of origin as a random effect. Infection status is a binary response, and cats with serum titers ≥1:160 were categorized as infected. Because a relatively large proportion (`r nrow(cats.complete)-nrow(cats.infect)`/`r nrow(cats.complete)`) of the sampled cats for which a complete record of observations was available had undetectable or low antibody titers (<1:160), only those with a positive infection status were included in the immune response analysis.
+
+I followed the general procedure outlined by Zuur and colleagues [-@zuur2007] for mixed-effects model development and selection. Models of *Toxoplasma* infection status were fitted using a binomial error distribution with a logit-link function. To improve the convergence of the models in the candidate set, I fit the models using mean-centered continuous variables which had been scaled by their respective standard deviations and sum-to-zero contrasts on the categorical variables `age`, `season`, and `sex`.
+
+The log-transformed antibody titer was modelled using a Gaussian error distribution with identity-link function. I performed all model fitting using the `lme4` package for R [@R-lme4, @R-base]. Optimization of the binomial mixed-effects models was performed using the nlminb optimizer from package `optimx` [@R-optimx].
+
+```{r MCMCglmmRanef, echo = FALSE, message = FALSE, warning = FALSE, eval = FALSE}
+
+## Attempt to fit ordered categorical mixed-effects model for infection status using MCMCglmm (not used).
+
+IS.ranef <- list( int = MCMCglmm( fixed = toxo160 ~ Jday + age + season + fiv + felv + catsincolony, 
+                                  random =        ~ us( 1 ):fcolony, 
+                                  data = cats.complete, 
+                                  family = "categorical" ), 
+                  Jday = MCMCglmm( fixed = toxo160 ~ Jday + age + season + fiv + felv + catsincolony, 
+                                   random =        ~ idh( 1 + Jday ):fcolony, 
+                                   data = cats.complete, 
+                                   family = "categorical" ), 
+                  Jday.age = MCMCglmm( fixed = toxo160 ~ Jday + age + season + fiv + felv + catsincolony, 
+                                       random =        ~ idh( 1 + Jday + age ):fcolony, 
+                                       data = cats.complete, 
+                                       family = "categorical" ), 
+                  age = MCMCglmm( fixed = toxo160 ~ Jday + age + season + fiv + felv + catsincolony, 
+                                  random =        ~ idh( 1 + age ):fcolony, 
+                                  data = cats.complete, 
+                                  family = "categorical" ), 
+                  season = MCMCglmm( fixed = toxo160 ~ Jday + age + season + fiv + felv + catsincolony, 
+                                     random =        ~ idh( 1 + season ):fcolony, 
+                                     data = cats.complete, 
+                                     family = "categorical" ), 
+                  fiv = MCMCglmm( fixed = toxo160 ~ Jday + age + season + fiv + felv + catsincolony, 
+                                  random =        ~ idh( 1 + fiv ):fcolony, 
+                                  data = cats.complete, 
+                                  family = "categorical" ), 
+                  fiv.felv = MCMCglmm( fixed = toxo160 ~ Jday + age + season + fiv + felv + catsincolony, 
+                                       random =        ~ idh( 1 + fiv + felv ):fcolony, 
+                                       data = cats.complete, 
+                                       family = "categorical" ), 
+                  felv = MCMCglmm( fixed = toxo160 ~ Jday + age + season + fiv + felv + catsincolony, 
+                                   random =        ~ idh( 1 + felv ):fcolony, 
+                                   data = cats.complete, 
+                                   family = "categorical" ) )
+
+IS.aicc <- sapply( X = IS.ranef, 
+                   FUN = AICc )
+IS.delta <- IS.aicc - min( IS.aicc )
+IS.wts <- exp( -0.5 * IS.delta )
+IS.wts <- IS.wts / sum( IS.wts )
+
+```
+
+```{r functionR, echo = FALSE, message = FALSE, warning = FALSE}
+
+## Build auxiliary functions.
+
+# ccheck compiles modelwise diagnostics for convergence and failure of merMods.
+ccheck <- function( .mm ){
+  
+  if( is.list( .mm ) ){
+    
+    fail <- sapply( .mm, function( .x ) !is.null( .x@optinfo$conv$lme4$messages ) )
+    relgrad <- sapply( .mm, function( .x ) max( abs( with( .x@optinfo$derivs, solve( Hessian, gradient ) ) ) ) )
+    gfail <- relgrad >= 0.001
+    minT <- sapply( .mm, function( .x ) min( getME( .x, "theta" )[ getME( .x, "lower" ) == 0 ] ) )
+    singular <- minT <= 0.000001
+    
+    results <- data.frame( mod = names( fail ), 
+                           fail = fail, 
+                           relgrad = relgrad, 
+                           gfail = gfail, 
+                           minT = minT, 
+                           singular = singular)
+    
+  }else{
+    
+    fail <- !is.null( .mm@optinfo$conv$lme4$messages )
+    relgrad <- max( abs( with( .mm@optinfo$derivs, solve( Hessian, gradient ) ) ) )
+    gfail <-  relgrad >= 0.001
+    minT <- min( getME( .mm, "theta" )[ getME( .mm, "lower" ) == 0 ] )
+    singular <- minT <= 0.000001
+    
+    results <- data.frame( fail = fail, 
+                           relgrad = relgrad, 
+                           gfail = gfail, 
+                           minT = minT, 
+                           singular = singular )
+    
+  }
+  
+  return( results )
+  
+}
+
+# r2.corr.mer gives a quick-and-dirty goodness-of-fit measure for merMods.
+# From Jarrett Byrnes, http://glmm.wikidot.com/faq
+r2.corr.mer <- function( .mm ){
+  
+  lmfit <-  lm( model.response( model.frame( .mm ) ) ~ fitted( .mm ) )
+  summary( lmfit )$adj.r.squared
+
+}
+
+# The logistic function
+logistic <- function( x ){
+  exp( x ) / ( 1 + exp( x ) )
+}
+
+# The following are adapted from `statmod::qresiduals`.
+
+qres2 <- function( .glmm ){
+  p <- fitted( .glmm )
+  y <- .glmm@resp$y
+  n <- .glmm@resp$n
+  y <- n * y
+  a <- pbinom( y - 1, n, p )
+  b <- pbinom( y, n, p )
+  u <- runif( n = length( y ), min = a, max = b )
+  qnorm( u )
+}
+
+qresD <- function( .lmm, dispersion = NULL ){
+  r <- residuals( .lmm, type = "deviance" )
+  if( is.null( dispersion ) ){
+    df.r <- df.residual( .lmm )
+    if( df.r > 0 ){
+      if( any( .lmm@resp$weights == 0 ) )
+        warning( "observations with zero weight", "not used for calculating dispersion" )
+      dispersion <- sum( .lmm@resp$weights * r^2 ) / df.r
+    }
+    else dispersion <- 1
+  }
+  r / sqrt( dispersion )
+}
+
+```
+
+```{r ISranef, echo = FALSE, message = FALSE, warning = FALSE}
+
+## Fit global binomial GLMMs of infection status with varying random-effects structures.
+
+IS.ranef <- list( int = glmer( toxo160 ~ Jday + age.2 + sex + season + fiv + felv + catsincolony + ( 1 | fcolony ), 
+                               data = cats.complete, 
+                               family = "binomial" ), 
+                  Jday = glmer( toxo160 ~ Jday + age.2 + sex + season + fiv + felv + catsincolony + ( Jday - 1 | fcolony ), 
+                                data = cats.complete, 
+                                family = "binomial" ), 
+                  Jday.int = glmer( toxo160 ~ Jday + age.2 + sex + season + fiv + felv + catsincolony + ( Jday | fcolony ), 
+                                    data = cats.complete, 
+                                    family = "binomial" ), 
+                  Jday_int = glmer( toxo160 ~ Jday + age.2 + sex + season + fiv + felv + catsincolony + ( 1 | fcolony ) + ( Jday - 1 | fcolony ), 
+                                    data = cats.complete, 
+                                    family = "binomial" ), 
+                  Jday_age = glmer( toxo160 ~ Jday + age.2 + sex + season + fiv + felv + catsincolony + ( Jday - 1 | fcolony ) + ( age.2 - 1 | fcolony ),
+                                    data = cats.complete,
+                                    family = "binomial" ), 
+                  # Jday.age = glmer( toxo160 ~ Jday + age.2 + sex + season + fiv + felv + catsincolony + ( Jday + age.2 - 1 | fcolony ),
+                  #                   data = cats.complete,
+                  #                   family = "binomial" ),
+                  # Jday.age_int = glmer( toxo160 ~ Jday + age.2 + sex + season + fiv + felv + catsincolony + ( 1 | fcolony ) + ( Jday + age.2 | fcolony ),
+                  #                       data = cats.complete,
+                  #                       family = "binomial" ),
+                  age = glmer( toxo160 ~ Jday + age.2 + season + sex + fiv + felv + catsincolony + ( age.2 - 1 | fcolony ), 
+                               data = cats.complete, 
+                               family = "binomial" ), 
+                  age.int = glmer( toxo160 ~ Jday + age.2 + season + sex + fiv + felv + catsincolony + ( age.2 | fcolony ), 
+                                   data = cats.complete, 
+                                   family = "binomial" ), 
+                  age_int = glmer( toxo160 ~ Jday + age.2 + season + sex + fiv + felv + catsincolony + ( 1 | fcolony ) + ( age.2 - 1 | fcolony ), 
+                                   data = cats.complete, 
+                                   family = "binomial" ), 
+                  season = glmer( toxo160 ~ Jday + age.2 + season + sex + fiv + felv + catsincolony + ( season - 1 | fcolony ), 
+                                  data = cats.complete, 
+                                  family = "binomial" ), 
+                  season.int = glmer( toxo160 ~ Jday + age.2 + season + sex + fiv + felv + catsincolony + ( season | fcolony ), 
+                                      data = cats.complete, 
+                                      family = "binomial" ), 
+                  season_int = glmer( toxo160 ~ Jday + age.2 + season + sex + fiv + felv + catsincolony + ( 1 | fcolony ) + ( season - 1 | fcolony ), 
+                                      data = cats.complete, 
+                                      family = "binomial" ), 
+                  fiv = glmer( toxo160 ~ Jday + age.2 + season + sex + fiv + felv + catsincolony + ( fiv - 1 | fcolony ), 
+                               data = cats.complete, 
+                               family = "binomial" ), 
+                  fiv.int = glmer( toxo160 ~ Jday + age.2 + season + sex + fiv + felv + catsincolony + ( fiv | fcolony ), 
+                                   data = cats.complete, 
+                                   family = "binomial" ), 
+                  fiv_int = glmer( toxo160 ~ Jday + age.2 + season + sex + fiv + felv + catsincolony + ( 1 | fcolony ) + ( fiv - 1 | fcolony ), 
+                                   data = cats.complete, 
+                                   family = "binomial" ), 
+                  fiv_felv = glmer( toxo160 ~ Jday + age.2 + sex + season + fiv + felv + catsincolony + ( fiv - 1 | fcolony ) + ( felv - 1 | fcolony ),
+                                    data = cats.complete,
+                                    family = "binomial" ),
+                  fiv.felv = glmer( toxo160 ~ Jday + age.2 + sex + season + fiv + felv + catsincolony + ( fiv + felv - 1 | fcolony ),
+                                    data = cats.complete,
+                                    family = "binomial" ),
+                  fiv.felv_int = glmer( toxo160 ~ Jday + age.2 + sex + season + fiv + felv + catsincolony + ( 1 | fcolony ) + ( fiv + felv - 1 | fcolony ),
+                                    data = cats.complete,
+                                    family = "binomial" ),
+                  felv = glmer( toxo160 ~ Jday + age.2 + sex + season + fiv + felv + catsincolony + ( felv - 1 | fcolony ), 
+                                data = cats.complete, 
+                                family = "binomial" ), 
+                  felv.int = glmer( toxo160 ~ Jday + age.2 + sex + season + fiv + felv + catsincolony + ( felv | fcolony ), 
+                                    data = cats.complete, 
+                                    family = "binomial" ), 
+                  felv_int = glmer( toxo160 ~ Jday + age.2 + sex + season + fiv + felv + catsincolony + ( 1 | fcolony ) + ( felv - 1 | fcolony ), 
+                                    data = cats.complete, 
+                                    family = "binomial" ) )
+
+# ccheck( IS.ranef ) # all fail; Jday_int, fiv, fiv_felv, and felv with OK relative gradients
+
+# Try centering and scaling; using sum-to-zero contrasts on categorical variables (fiv and felv?)
+cscats.complete <- cats.complete %>% mutate( Jday = ( Jday - mean( Jday ) ) / sd( Jday ), 
+                                             catsincolony = ( catsincolony - mean( catsincolony ) ) / sd( catsincolony ) )
+contrasts( cscats.complete$age.2 ) <- contr.sum( 2 )
+contrasts( cscats.complete$season ) <- contr.sum( 2 )
+contrasts( cscats.complete$sex ) <- contr.sum( 2 )
+
+
+# IS.ranef_cs <- lapply( X = IS.ranef,
+#                        FUN = function( .mm ) update( .mm, data = cscats.complete ) )
+# 
+# # ccheck( IS.ranef_cs ) # int, fiv, and felv no longer failing and with OK relative gradients
+# 
+# # Try increasing # of interations
+# IS.ranef_cs.plus <- lapply( X = IS.ranef, 
+#                             FUN = function( .mm ) update( .mm, 
+#                                                           data = cscats.complete, 
+#                                                           start = getME( .mm, c( "theta", "fixef" ) ), 
+#                                                           control = glmerControl( optCtrl = list( maxfun = 2e4 ) ) ) )
+# 
+# # ccheck( IS.ranef_cs.plus ) # Jday and fiv_felv also no longer failing, and they along with age.int, season.int, and fiv.int have OK gradients
+# 
+# # Try using bobyqa optimizer
+# IS.ranef_cs.plus.bobyqa <- lapply( X = IS.ranef, 
+#                                    FUN = function( .mm ) update( .mm, 
+#                                                                  data = cscats.complete, 
+#                                                                  start = getME( .mm, c( "theta", "fixef" ) ), 
+#                                                                  control = glmerControl( optimizer = "bobyqa", 
+#                                                                                          optCtrl = list( maxFun = 2e5 ) ) ) )
+
+# ccheck( IS.ranef_cs.plus.bobyqa ) # lots (44!) of warnings, but only age_int and fiv.int are failing, and only season_int has a poor Hessian
+
+# Try using nlminb optimizer
+IS.ranef_cs.plus.nlminb <- lapply( X = IS.ranef, 
+                                   FUN = function( .mm ) update( .mm, 
+                                                                 data = cscats.complete, 
+                                                                 start = getME( .mm, c( "theta", "fixef" ) ), 
+                                                                 control = glmerControl( optimizer = "optimx", 
+                                                                                         optCtrl = list( method = "nlminb", 
+                                                                                                         maxit = 2e5 ) ) ) )
+
+# ccheck( IS.ranef_cs.plus.nlminb ) # age_int, fiv.int, fiv_int, and fiv.felv_int failing; all with OK gradients
+
+# I'll take it.
+
+# Create AICc model selection table for random-effects structures on infection status models.
+IS.ranef_aicc <- sapply( X = IS.ranef_cs.plus.nlminb, 
+                         FUN = AICc )
+IS.ranef_delta <- IS.ranef_aicc - min( IS.ranef_aicc )
+IS.ranef_wts <- exp( -0.5 * IS.ranef_delta )
+IS.ranef_wts <- IS.ranef_wts / sum( IS.ranef_wts )
+# IS.ranef_rsq <- sapply( X = IS.ranef_cs.plus.nlminb, 
+#                         FUN = r2.corr.mer )
+
+IS.ranef_selection <- data.frame( mod = names( IS.ranef ), 
+                                  AICc = IS.ranef_aicc, 
+                                  DeltaAICc = IS.ranef_delta, 
+                                  Wts = IS.ranef_wts )[ order( IS.ranef_delta ), ]
+
+```
+
+```{r Tranef, echo = FALSE, message = FALSE, warning = FALSE}
+
+## Fit global LMMs of log-transformed titer with varying random-effects structures.
+
+Titer.ranef <- list( int = lmer( ttoxo.titer ~ Jday + age.2 + sex + season + fiv + felv + catsincolony + ( 1 | fcolony ), 
+                                 data = cats.infect ), 
+                     Jday = lmer( ttoxo.titer ~ Jday + age.2 + sex + season + fiv + felv + catsincolony + ( Jday - 1 | fcolony ), 
+                                  data = cats.infect ), 
+                     Jday_int = lmer( ttoxo.titer ~ Jday + age.2 + sex + season + fiv + felv + catsincolony + ( 1 | fcolony ) + ( Jday - 1 | fcolony ), 
+                                      data = cats.infect ), 
+                     # Jday.age = lmer( ttoxo.titer ~ Jday + age.2 + sex + season + fiv + felv + catsincolony + ( Jday - 1 | fcolony ) + ( age.2 - 1 | fcolony ),
+                     #                   data = cats.infect ),
+                     # age = lmer( ttoxo.titer ~ Jday + age.2 + sex + season + fiv + felv + catsincolony + ( age.2 - 1 | fcolony ),
+                     #             data = cats.infect ),
+                     # season = lmer( ttoxo.titer ~ Jday + age.2 + sex + season + fiv + felv + catsincolony + ( season - 1 | fcolony ),
+                     #                data = cats.infect ),
+                     fiv = lmer( ttoxo.titer ~ Jday + age.2 + sex + season + fiv + felv + catsincolony + ( fiv - 1 | fcolony ),
+                                 data = cats.infect ),
+                     # fiv.felv = lmer( ttoxo.titer ~ Jday + age.2 + sex + season + fiv + felv + catsincolony + ( fiv + felv - 1 | fcolony ),
+                     #                   data = cats.infect ),
+                     felv = lmer( ttoxo.titer ~ Jday + age.2 + sex + season + fiv + felv + catsincolony + ( felv - 1 | fcolony ),
+                                  data = cats.infect ) )
+
+# # ccheck( Titer.ranef ) # All OK! But let's try centering and scaling.
+# cscats.infect <- cats.infect %>% mutate( Jday = ( Jday - mean( Jday ) ) / sd( Jday ), 
+#                                          catsincolony = ( catsincolony - mean( catsincolony ) ) / sd( catsincolony ) )
+# contrasts( cscats.infect$age.2 ) <- contr.sum( 2 )
+# contrasts( cscats.infect$sex ) <- contr.sum( 2 )
+# 
+# Titer.ranef_cs <- lapply( X = Titer.ranef, 
+#                           FUN = function( .mm ) update( .mm, data = cscats.infect ) )
+# 
+# # ccheck( Titer.ranef_cs ) # Still OK. I'm going to try bobyqa and nlminb, but I'll probably still go with the original fit.
+# 
+# Titer.ranef_cs.bobyqa <- lapply( X = Titer.ranef_cs, 
+#                                  FUN = function( .mm ) update( .mm, control = lmerControl( optimizer = "bobyqa" ) ) )
+# 
+# # ccheck( Titer.ranef_cs.bobyqa ) # Still OK. (Imagine that!)
+# 
+# Titer.ranef_cs.nlminb <- lapply( X = Titer.ranef_cs, 
+#                                  FUN = function( .mm ) update( .mm, control = lmerControl( optimizer = "optimx", optCtrl = list( method = "nlminb" ) ) ) )
+# 
+# # ccheck( Titer.ranef_cs.nlminb ) # OK. back to the original fit.
+
+# Construct AICc model selection table for random-effects structures on titer models.
+Titer.ranef_aicc <- sapply( X = Titer.ranef, 
+                            FUN = AICc )
+Titer.ranef_delta <- Titer.ranef_aicc - min( Titer.ranef_aicc )
+Titer.ranef_wts <- exp( -0.5 * Titer.ranef_delta )
+Titer.ranef_wts <- Titer.ranef_wts / sum( Titer.ranef_wts )
+Titer.ranef_rsq <- sapply( X = Titer.ranef, 
+                           FUN = r2.corr.mer )
+
+Titer.ranef_selection <- data.frame( mod = names( Titer.ranef ), 
+                                     AICc = Titer.ranef_aicc, 
+                                     DeltaAICc = Titer.ranef_delta, 
+                                     Wts = Titer.ranef_wts )[ order( Titer.ranef_delta ), ]
+
+```
+
+For both analyses, I used a global fixed-effects model (including main effects for age, sex, FIV infection status, FeLV infection status, Julian date of sampling, season, and number of cats sampled from the same colony) to select the optimal random-effects structure on the basis of Akaike's Information Criterion with a second-order correction for small sample size [AIC$_c$; @anderson2008]. To reduce bias in the random-effects estimates, I used restricted maximum likelihood (REML) estimation methods to fit the linear mixed-effects models (with log-transformed titer as the response). REML has not yet been implemented in `lme4` for generalized mixed-effects modelling. In 
+
+In the limited (immune response) analysis, the sizes of the random-effects candidate structures were constrained by the large number of levels in the random effect (`r length(unique(cats.infect$colony))`) relative to the sample size (*N* = `r nrow(cats.infect)`). 
+Owing to the presence of model selection uncertainty with regard to the different random-effects structures (see Tables \@ref(tab:ISranefSelect) and \@ref(tab:TranefSelect) in the [Appendix](#appendix)), I optimized the fixed-effects structures independently for each of the two top-ranked models of both analyses. Using the global fixed-effects structure, I also performed validation and specification-checking independently for the two top-ranked random-effects structures from each analysis (see Figures \@ref(fig:ISintValidatR) -- \@ref(fig:TJdayFvO) in the [Appendix](#appendix)). Each model was evaluated graphically to assess goodness-of-fit and the validity of the assumptions implicit in the model-fitting.
+
+```{r ISfixef, echo = FALSE, message = FALSE, warning = FALSE}
+
+## Stepwise backward selection of fixed effects for infection status models using top 2 random-effects structures.
+
+## ITERATION: 1
+
+# IS.fixef <- list( age.int = IS.ranef_cs.plus.nlminb[[ "age.int" ]],
+#                   age = IS.ranef_cs.plus.nlminb[[ "age" ]] )
+# 
+# summary( IS.fixef[[ "age.int" ]] ) # least significant term: `sex` (p = 0.9479)
+# summary( IS.fixef[[ "age" ]] ) # least significant term: `sex` (p = 0.9478)
+
+## ITERATION: 2
+
+# IS.fixef <- list( age.int = glmer( toxo160 ~ Jday + age.2 + season + fiv + felv + catsincolony + ( age.2 | fcolony ),
+#                                data = cscats.complete,
+#                                family = "binomial",
+#                                control = glmerControl( optimizer = "optimx",
+#                                                        optCtrl = list( method = "nlminb",
+#                                                                        maxit = 2e5 ) ) ),
+#                   age = glmer( toxo160 ~ Jday + age.2 + season + fiv + felv + catsincolony + ( age.2 - 1 | fcolony ),
+#                                data = cscats.complete,
+#                                family = "binomial",
+#                                control = glmerControl( optimizer = "optimx",
+#                                                        optCtrl = list( method = "nlminb",
+#                                                                        maxit = 2e5 ) ) ) )
+#
+# summary( IS.fixef[[ "age.int" ]] ) # least significant term: `season` (p = 0.6987)
+# summary( IS.fixef[[ "age" ]] ) # least significant term: `season` (p = 0.6987)
+
+## ITERATION: 3
+
+# IS.fixef <- list( age.int = glmer( toxo160 ~ Jday + age.2 + fiv + felv + catsincolony + ( age.2 | fcolony ),
+#                                    data = cscats.complete,
+#                                    family = "binomial", 
+#                                    control = glmerControl( optimizer = "optimx", 
+#                                                            optCtrl = list( method = "nlminb", 
+#                                                                            maxit = 2e5 ) ) ),
+#                   age = glmer( toxo160 ~ Jday + age.2 + fiv + felv + catsincolony + ( age.2 - 1 | fcolony ),
+#                                data = cscats.complete,
+#                                family = "binomial", 
+#                                control = glmerControl( optimizer = "optimx", 
+#                                                        optCtrl = list( method = "nlminb", 
+#                                                                        maxit = 2e5 ) ) ) )
+# 
+# summary( IS.fixef[[ "age.int" ]] ) # least significant term: `Jday` (p = 0.4820)
+# summary( IS.fixef[[ "age" ]] ) # least significant term: `Jday` (p = 0.4820)
+
+## ITERATION: 4
+
+# IS.fixef <- list( age.int = glmer( toxo160 ~ age.2 + fiv + catsincolony + ( age.2 | fcolony ),
+#                                    data = cscats.complete,
+#                                    family = "binomial", 
+#                                    control = glmerControl( optimizer = "optimx", 
+#                                                            optCtrl = list( method = "nlminb", 
+#                                                                            maxit = 2e5 ) ) ),
+#                   age = glmer( toxo160 ~ age.2 + fiv + felv + catsincolony + ( age.2 - 1 | fcolony ),
+#                                data = cscats.complete,
+#                                family = "binomial", 
+#                                control = glmerControl( optimizer = "optimx", 
+#                                                        optCtrl = list( method = "nlminb", 
+#                                                                        maxit = 2e5 ) ) ) )
+# 
+# summary( IS.fixef[[ "age.int" ]] ) # least significant term: `catsincolony` (p = 0.13817)
+# summary( IS.fixef[[ "age" ]] ) # least significant term: `catsincolony` (p = 0.1504)
+
+## ITERATION: 5
+
+# IS.fixef <- list( age.int = glmer( toxo160 ~ age.2 + fiv + felv + ( age.2 | fcolony ),
+#                                    data = cscats.complete,
+#                                    family = "binomial", 
+#                                    control = glmerControl( optimizer = "optimx", 
+#                                                            optCtrl = list( method = "nlminb", 
+#                                                                            maxit = 2e5 ) ) ),
+#                   age = glmer( toxo160 ~ age.2 + fiv + felv + ( age.2 - 1 | fcolony ),
+#                                data = cscats.complete,
+#                                family = "binomial", 
+#                                control = glmerControl( optimizer = "optimx", 
+#                                                        optCtrl = list( method = "nlminb", 
+#                                                                        maxit = 2e5 ) ) ) )
+# 
+# summary( IS.fixef[[ "age.int" ]] ) # least significant term: `felv` (p = 0.10147)
+# summary( IS.fixef[[ "age" ]] ) # least significant term: `felv` (p = 0.10147)
+
+## ITERATION: 6
+
+IS.fixef <- list( age.int = glmer( toxo160 ~ age.2 + fiv + ( age.2 | fcolony ), 
+                                   data = cscats.complete, 
+                                   family = "binomial", 
+                                   control = glmerControl( optimizer = "optimx", 
+                                                           optCtrl = list( method = "nlminb", 
+                                                                           maxit = 2e5 ) ) ), 
+                  age = glmer( toxo160 ~ age.2 + fiv + ( age.2 - 1 | fcolony ), 
+                               data = cscats.complete, 
+                               family = "binomial", 
+                               control = glmerControl( optimizer = "optimx", 
+                                                       optCtrl = list( method = "nlminb", 
+                                                                       maxit = 2e5 ) ) ) )
+
+# summary( IS.fixef[[ "age.int" ]] ) # least significant term: `fiv` (p = 0.00255)
+# summary( IS.fixef[[ "age" ]] ) # least significant term: `fiv` (p = 0.00256)
+
+```
+
+```{r Tfixef, echo = FALSE, message = FALSE, warning = FALSE}
+
+## Stepwise backward selection of fixed effects for titer models using top 2 random-effects structures.
+
+library( lmerTest )
+
+# Titer.fixef <- list( int = update( Titer.ranef[[ "int" ]], REML = FALSE ), 
+#                      Jday = update( Titer.ranef[[ "Jday" ]], REML = FALSE ), 
+#                      # Jday_int = update( Titer.ranef[[ "Jday_int" ]], REML = FALSE ), # Apparently step can't handle two random effects (actually an issue with Hmisc::substring.location and later handling in lmerTest:::fmElimRandTerm) This was the poorest-performing model by AICc, so I'll just...drop it... :\
+#                      fiv = update( Titer.ranef[[ "fiv" ]], REML = FALSE ), 
+#                      felv = update( Titer.ranef[[ "felv" ]], REML = FALSE ) )
+# 
+# Titer.fixef <- list( int = step( Titer.fixef[[ "int" ]], type = 1 ), 
+#                      Jday = step( Titer.fixef[[ "Jday" ]], type = 1 ), 
+#                      # Jday_int = step( Titer.fixef[[ "Jday_int" ]], type = 1 ), 
+#                      fiv = step( Titer.fixef[[ "fiv" ]], type = 1 ), 
+#                      felv = step( Titer.fixef[[ "felv" ]], type = 1 ) )
+
+## On second thought, I just won't automate this process. I'll do it iteratively, as in ISfixef
+
+## ITERATION: 1
+
+# Titer.fixef <- list( int = lmer( ttoxo.titer ~ Jday + age.2 + sex + season + fiv + felv + catsincolony + ( 1 | fcolony ), 
+#                                  data = cats.infect, 
+#                                  REML = FALSE ), 
+#                      Jday = lmer( ttoxo.titer ~ Jday + age.2 + sex + season + fiv + felv + catsincolony + ( Jday - 1 | fcolony ), 
+#                                   data = cats.infect, 
+#                                   REML = FALSE ), 
+#                      Jday_int = lmer( ttoxo.titer ~ Jday + age.2 + sex + season + fiv + felv + catsincolony + ( 1 | fcolony ) + ( Jday - 1 | fcolony ), 
+#                                       data = cats.infect, 
+#                                       REML = FALSE ), 
+#                      fiv = lmer( ttoxo.titer ~ Jday + age.2 + sex + season + fiv + felv + catsincolony + ( fiv - 1 | fcolony ),
+#                                  data = cats.infect, 
+#                                  REML = FALSE ),
+#                      felv = lmer( ttoxo.titer ~ Jday + age.2 + sex + season + fiv + felv + catsincolony + ( felv - 1 | fcolony ),
+#                                   data = cats.infect, 
+#                                   REML = FALSE ) )
+# 
+# summary( Titer.fixef[[ "int" ]] ) # least significant term: `age.2` (p = 0.6447)
+# summary( Titer.fixef[[ "Jday" ]] ) # least significant term: `sex` (p = 0.5188)
+# summary( Titer.fixef[[ "Jday_int" ]] ) # least significant term: `age.2` (p=0.6447)
+# summary( Titer.fixef[[ "fiv" ]] ) # least significant term: `sex` (p = 0.5188)
+# summary( Titer.fixef[[ "felv" ]] ) # least significant term: `sex` (p = 0.5188)
+
+## ITERATION: 2
+
+# Titer.fixef <- list( int = lmer( ttoxo.titer ~ Jday + sex + season + fiv + felv + catsincolony + ( 1 | fcolony ), 
+#                                  data = cats.infect, 
+#                                  REML = FALSE ), 
+#                      Jday = lmer( ttoxo.titer ~ Jday + age.2 + season + fiv + felv + catsincolony + ( Jday - 1 | fcolony ), 
+#                                   data = cats.infect, 
+#                                   REML = FALSE ), 
+#                      Jday_int = lmer( ttoxo.titer ~ Jday + sex + season + fiv + felv + catsincolony + ( 1 | fcolony ) + ( Jday - 1 | fcolony ), 
+#                                       data = cats.infect, 
+#                                       REML = FALSE ), 
+#                      fiv = lmer( ttoxo.titer ~ Jday + age.2 + season + fiv + felv + catsincolony + ( fiv - 1 | fcolony ),
+#                                  data = cats.infect, 
+#                                  REML = FALSE ),
+#                      felv = lmer( ttoxo.titer ~ Jday + age.2 + season + fiv + felv + catsincolony + ( felv - 1 | fcolony ),
+#                                   data = cats.infect, 
+#                                   REML = FALSE ) )
+# 
+# summary( Titer.fixef[[ "int" ]] ) # least significant term: `season` (p = 0.5492)
+# summary( Titer.fixef[[ "Jday" ]] ) # least significant term: `season` (p = 0.4233)
+# summary( Titer.fixef[[ "Jday_int" ]] ) # least significant term: `season` (p=0.5492)
+# summary( Titer.fixef[[ "fiv" ]] ) # least significant term: `season` (p = 0.4233)
+# summary( Titer.fixef[[ "felv" ]] ) # least significant term: `season` (p = 0.4233)
+
+## ITERATION: 3
+
+# Titer.fixef <- list( int = lmer( ttoxo.titer ~ Jday + sex + fiv + felv + catsincolony + ( 1 | fcolony ), 
+#                                  data = cats.infect, 
+#                                  REML = FALSE ), 
+#                      Jday = lmer( ttoxo.titer ~ Jday + age.2 + fiv + felv + catsincolony + ( Jday - 1 | fcolony ), 
+#                                   data = cats.infect, 
+#                                   REML = FALSE ), 
+#                      Jday_int = lmer( ttoxo.titer ~ Jday + sex + fiv + felv + catsincolony + ( 1 | fcolony ) + ( Jday - 1 | fcolony ), 
+#                                       data = cats.infect, 
+#                                       REML = FALSE ), 
+#                      fiv = lmer( ttoxo.titer ~ Jday + age.2 + fiv + felv + catsincolony + ( fiv - 1 | fcolony ),
+#                                  data = cats.infect, 
+#                                  REML = FALSE ),
+#                      felv = lmer( ttoxo.titer ~ Jday + age.2 + fiv + felv + catsincolony + ( felv - 1 | fcolony ),
+#                                   data = cats.infect, 
+#                                   REML = FALSE ) )
+# 
+# summary( Titer.fixef[[ "int" ]] ) # least significant term: `fiv` (p = 0.4173)
+# summary( Titer.fixef[[ "Jday" ]] ) # least significant term: `age.2` (p = 0.4790)
+# summary( Titer.fixef[[ "Jday_int" ]] ) # least significant term: `fiv` (p =0.4173)
+# summary( Titer.fixef[[ "fiv" ]] ) # least significant term: `age.2` (p = 0.4790)
+# summary( Titer.fixef[[ "felv" ]] ) # least significant term: `age.2` (p = 0.4790)
+
+## ITERATION: 4
+
+# Titer.fixef <- list( int = lmer( ttoxo.titer ~ Jday + sex + felv + catsincolony + ( 1 | fcolony ), 
+#                                  data = cats.infect, 
+#                                  REML = FALSE ), 
+#                      Jday = lmer( ttoxo.titer ~ Jday + fiv + felv + catsincolony + ( Jday - 1 | fcolony ), 
+#                                   data = cats.infect, 
+#                                   REML = FALSE ), 
+#                      Jday_int = lmer( ttoxo.titer ~ Jday + sex + felv + catsincolony + ( 1 | fcolony ) + ( Jday - 1 | fcolony ), 
+#                                       data = cats.infect, 
+#                                       REML = FALSE ), 
+#                      fiv = lmer( ttoxo.titer ~ Jday + fiv + felv + catsincolony + ( fiv - 1 | fcolony ),
+#                                  data = cats.infect, 
+#                                  REML = FALSE ),
+#                      felv = lmer( ttoxo.titer ~ Jday + fiv + felv + catsincolony + ( felv - 1 | fcolony ),
+#                                   data = cats.infect, 
+#                                   REML = FALSE ) )
+# 
+# summary( Titer.fixef[[ "int" ]] ) # least significant term: `catsincolony` (p = 0.4032)
+# summary( Titer.fixef[[ "Jday" ]] ) # least significant term: `fiv` (p = 0.1514)
+# summary( Titer.fixef[[ "Jday_int" ]] ) # least significant term: `catsincolony` (p = 0.4032)
+# summary( Titer.fixef[[ "fiv" ]] ) # least significant term: `fiv` (p = 0.1514)
+# summary( Titer.fixef[[ "felv" ]] ) # least significant term: `fiv` (p = 0.1514)
+
+## ITERATION: 5
+
+# Titer.fixef <- list( int = lmer( ttoxo.titer ~ Jday + sex + felv + ( 1 | fcolony ), 
+#                                  data = cats.infect, 
+#                                  REML = FALSE ), 
+#                      Jday = lmer( ttoxo.titer ~ Jday + felv + catsincolony + ( Jday - 1 | fcolony ), 
+#                                   data = cats.infect, 
+#                                   REML = FALSE ), 
+#                      Jday_int = lmer( ttoxo.titer ~ Jday + sex + felv + ( 1 | fcolony ) + ( Jday - 1 | fcolony ), 
+#                                       data = cats.infect, 
+#                                       REML = FALSE ), 
+#                      fiv = lmer( ttoxo.titer ~ Jday + fiv + felv + catsincolony + ( fiv - 1 | fcolony ),
+#                                  data = cats.infect, 
+#                                  REML = FALSE ),
+#                      felv = lmer( ttoxo.titer ~ Jday + felv + catsincolony + ( felv - 1 | fcolony ),
+#                                   data = cats.infect, 
+#                                   REML = FALSE ) )
+# 
+# summary( Titer.fixef[[ "int" ]] ) # least significant term: `sex` (p = 0.2128)
+# summary( Titer.fixef[[ "Jday" ]] ) # least significant term: `catsincolony` (p = 0.1119)
+# summary( Titer.fixef[[ "Jday_int" ]] ) # least significant term: `sex` (p = 0.2128)
+# summary( Titer.fixef[[ "fiv" ]] ) # least significant term: `fiv` (p = 0.1514)
+# summary( Titer.fixef[[ "felv" ]] ) # least significant term: `catsincolony` (p = 0.1119)
+
+## ITERATION: 6
+
+# Titer.fixef <- list( int = lmer( ttoxo.titer ~ Jday + felv + ( 1 | fcolony ), 
+#                                  data = cats.infect, 
+#                                  REML = FALSE ), 
+#                      Jday = lmer( ttoxo.titer ~ Jday + felv + ( Jday - 1 | fcolony ), 
+#                                   data = cats.infect, 
+#                                   REML = FALSE ), 
+#                      Jday_int = lmer( ttoxo.titer ~ Jday + felv + ( 1 | fcolony ) + ( Jday - 1 | fcolony ), 
+#                                       data = cats.infect, 
+#                                       REML = FALSE ), 
+#                      fiv = lmer( ttoxo.titer ~ Jday + fiv + felv + catsincolony + ( fiv - 1 | fcolony ),
+#                                  data = cats.infect, 
+#                                  REML = FALSE ),
+#                      felv = lmer( ttoxo.titer ~ Jday + felv + ( felv - 1 | fcolony ),
+#                                   data = cats.infect, 
+#                                   REML = FALSE ) )
+# 
+# summary( Titer.fixef[[ "int" ]] ) # least significant term: `Jday` (p = 0.1441)
+# summary( Titer.fixef[[ "Jday" ]] ) # least significant term: `felv` (p = 0.0446)
+# summary( Titer.fixef[[ "Jday_int" ]] ) # least significant term: `Jday` (p = 0.1441)
+# summary( Titer.fixef[[ "fiv" ]] ) # least significant term: `fiv` (p = 0.1514)
+# summary( Titer.fixef[[ "felv" ]] ) # least significant term: `Jday` (p = 0.0716)
+
+## ITERATION: 7
+
+Titer.fixef <- list( int = lmer( ttoxo.titer ~ felv + ( 1 | fcolony ), 
+                                 data = cats.infect, 
+                                 REML = FALSE ), 
+                     Jday = lmer( ttoxo.titer ~ Jday + felv + ( Jday - 1 | fcolony ), 
+                                  data = cats.infect, 
+                                  REML = FALSE ), 
+                     Jday_int = lmer( ttoxo.titer ~ Jday + felv + ( 1 | fcolony ) + ( Jday - 1 | fcolony ), 
+                                      data = cats.infect, 
+                                      REML = FALSE ), 
+                     fiv = lmer( ttoxo.titer ~ Jday + fiv + felv + catsincolony + ( fiv - 1 | fcolony ),
+                                 data = cats.infect, 
+                                 REML = FALSE ),
+                     felv = lmer( ttoxo.titer ~ felv + ( felv - 1 | fcolony ),
+                                  data = cats.infect, 
+                                  REML = FALSE ) )
+
+# summary( Titer.fixef[[ "int" ]] ) # least significant term: `felv` (p = 0.0364)
+# summary( Titer.fixef[[ "Jday" ]] ) # least significant term: `felv` (p = 0.0446)
+# summary( Titer.fixef[[ "Jday_int" ]] ) # least significant term: `Jday` (p = 0.1441)
+# summary( Titer.fixef[[ "fiv" ]] ) # least significant term: `fiv` (p = 0.1514)
+# summary( Titer.fixef[[ "felv" ]] ) # least significant term: `felv` (p = 0.0598)
+
+detach( package:lmerTest, unload = TRUE )
+
+```
+
+The final fixed-effects structure for each of the four models was determined by a backwards-selection approach, using *p*-values calculated by `lme4::glmer` [@R-lme4] for the infection status GLMMs and by `lmerTest::lmer` [@R-lmerTest] for the titer LMMs. In the latter case, models were re-fitted using un-restricted maximum likelihood (ML) methods prior to backwards selection. Stepwise variable elimination was terminated once all remaining fixed effects were significant at the $\alpha$ = 0.05 level.
+
+This model selection process yielded four models having unique fixed- and random-effects structures---two with *Toxoplasma* infection status and two with (log-transformed) anti-*Toxoplasma* IgG antibody titer as the response. For each response variable, I generated predictions based upon the single model which appeared to best fit the data and conform to the model assumptions (as assessed during model validation, see [Appendix](#appendix)).
+
+###**R E S U L T S** {#results}
+
+Between March 2006 and October 2008, `r nrow(cats)` cats were sampled, of which `r nrow(cats.complete)` represented complete observations sourced from 'managed' colonies. Using a serum titer of ≥1:160 as a cut-off for positive infection status [@vanWormer2013], `r nrow(cats.infect)` cats were identified as having a history of infection by *Toxoplasma gondii*. Between `r min(cats.colonies$catsincolony)` and `r max(cats.colonies$catsincolony)` cats were sampled from each of `r nrow(cats.colonies)` colonies ($\bar{x}$ = `r round(mean(cats.colonies$catsincolony),2)`, $s$ = `r round(sd(cats.colonies$catsincolony),2)`, median = `r median(cats.colonies$catsincolony)`). Of those colonies, `r length(unique(cats.infect$colony))` had *Toxoplasma*-positive cats.
+
+Samples were collected from `r nrow(filter(cats.complete,age.2=="juvenile"))` juvenile (≤12 months; `r nrow(filter(cats.complete,age.2=="juvenile",sex=="m"))` male and `r nrow(filter(cats.complete,age.2=="juvenile",sex=="f"))` female) and `r nrow(filter(cats.complete,age.2=="adult"))` adult (`r nrow(filter(cats.complete,age.2=="adult",sex=="m"))` male and `r nrow(filter(cats.complete,age.2=="adult",sex=="f"))` female) cats. Sampling was fairly evenly distributed between the wet (*N* = `r nrow(filter(cats.complete,season=="wet"))`) and dry (*N* = `r nrow(filter(cats.complete,season=="dry"))`) seasons. `r sum(cats.complete$fiv)` cats tested FIV-positive
+
+```{r demogRaphy, echo = FALSE, message = FALSE, warning = FALSE}
+
+peRcent <- function( .var, .lev ){
+  
+  subCats <- cats.complete[ which( cats.complete[[ .var ]] == .lev ), ]
+  
+  n <- nrow( subCats )
+  npos <- sum( subCats$toxo160 )
+  nneg <- ( n - npos ) * 100 / n
+  npos <- npos * 100 / n
+  
+  return( c( n = n, tneg = nneg, tpos = npos ) )
+  
+}
+
+conTable <- data.frame( Tstat = c( "n", "*Toxoplasma*-negative", "*Toxoplasma*-positive" ), 
+                        Juvenile = peRcent( "age.2", "juvenile" ), 
+                        Adult = peRcent( "age.2", "adult" ), 
+                        Male = peRcent( "sex", "m" ), 
+                        Female = peRcent( "sex", "f" ), 
+                        Wet = peRcent( "season", "wet" ), 
+                        Dry = peRcent( "season", "dry" ), 
+                        FIV = peRcent( "fiv", 1 ), 
+                        FeLV = peRcent( "felv", 1 ), stringsAsFactors = FALSE )
+
+N <- sapply( X = conTable[ 1, ], 
+             FUN = function( .n ) paste( "(*N* = ", .n, ")", sep = "" ) )
+row.names( conTable ) <- NULL
+
+conTable[ , 2:ncol( conTable ) ] <- apply( X = conTable[ , 2:ncol( conTable ) ], 
+                                           MARGIN = 2, 
+                                           FUN = function( .nn ) paste( round( .nn, 1 ), "%", sep = "" ) )
+conTable[ 1, ] <- N
+conTable[ 1, 1 ] <- ""
+names( conTable )[ 1 ] <- ""
+
+kable( x = conTable, 
+       format = "pandoc", 
+       caption = "Percent of cats tested")
+
+```
+
+
+###**A P P E N D I X** {#appendix}
+
+####*Variables*
+
+```{r vaRs, echo = FALSE, message = FALSE, warning = FALSE}
+
+varDf <- data.frame( Variable = c( "**`cat`**", 
+                                   "**`date`**", 
+                                   "**`Jday`**", 
+                                   "**`season`**", 
+                                   "**`sex`**", 
+                                   "**`age`**", 
+                                   "**`toxo.titer`**", 
+                                   "**`toxo160`**", 
+                                   "**`fiv`**", 
+                                   "**`felv`**", 
+                                   "**`type`**", 
+                                   "**`colony`**", 
+                                   "**`catsincolony`**", 
+                                   "**`latitude`**/**`longitude`**" ), 
+                     Description = c( "Individual identifier [*N* = 678]", 
+                                      "Date of sample collection [03/27/2006--10/07/2008]", 
+                                      "Julian date of sampling [Jan 1 = 1 ... Dec 31 = 365]", 
+                                      "Season of sample collection [wet/dry]", 
+                                      "Sex of cat [M/F]", 
+                                      "Age of cat [≤12 months/>12 months]", 
+                                      "Serum titer of anti-*Toxoplasma* IgG antibodies [<1:40/1:40/1:80/.../>1:81,920]", 
+                                      "*Toxoplasma* infection status [0 = no history of infection, 1 = history of infection]", 
+                                      "FIV infection status [0/1]", 
+                                      "FeLV infection status [0/1]", 
+                                      "Colony type [managed/depredated]", 
+                                      "Colony identifier [*N* = 241]", 
+                                      "Number of cats sampled from colony [1--31]", 
+                                      "Location of animal collection [36.020--37.12886°N/122.116--121.022°W]" ) )
+
+kable( x = varDf, 
+       format = "pandoc", 
+       caption = "Variables included in original dataset [@vanWormer2013]. Samples from 'depredated' colonies represent individuals euthanized by law enforcement officials and land managers, and were excluded from the present analysis. The original dataset included observations of 739 individuals representing 255 colonies. Removal of incomplete observations and those from depredated felids reduced the sample size to that presented above. Serum titers of immunoglobulin G (IgG) antibodies to *Toxoplasma* determined by indirect fluorescent antibody test (IFAT); infection by FIV and FeLV determined by IDEXX SNAP combined FIV Ab and FeLV Ag ELISA." )
+
+```
+
+####*Model selection*
+
+#####<u>Infection status</u>
+
+```{r ISranefSelect, echo = FALSE, message = FALSE, warning = FALSE}
+
+IS.ranef_print <- IS.ranef_selection
+
+row.names( IS.ranef_print ) <- NULL
+
+ranefStructs <- c( int = "**`( 1 | colony )`**", 
+                   Jday = "**`( Jday - 1 | colony )`**", 
+                   Jday.int = "**`( Jday | colony )`**", 
+                   Jday_int = "**`( 1 | colony ) + ( Jday - 1 | colony )`**", 
+                   Jday_age = "**`( Jday - 1 | colony ) + ( age - 1 | colony )`**",
+                   age = "**`( age - 1 | colony )`**", 
+                   age.int = "**`( age | colony )`**", 
+                   age_int = "**`( 1 | colony ) + ( age - 1 | colony )`**", 
+                   season = "**`( season - 1 | colony )`**", 
+                   season.int = "**`( season | colony )`**", 
+                   season_int = "**`( 1 | colony ) + ( season - 1 | colony )`**", 
+                   fiv = "**`( FIV - 1 | colony )`**", 
+                   fiv.int = "**`( FIV | colony )`**", 
+                   fiv_int = "**`( 1 | colony ) + ( FIV - 1 | colony )`**", 
+                   fiv_felv = "**`( FIV - 1 | colony ) + ( FeLV - 1 | colony )`**", 
+                   fiv.felv = "**`( FIV + FeLV - 1 | colony )`**", 
+                   fiv.felv_int = "**`( 1 | colony ) + FIV + FeLV - 1 | colony )`**", 
+                   felv = "**`( FeLV - 1 | colony )`**", 
+                   felv.int = "**`( FeLV | colony )`**", 
+                   felv_int = "**`( 1 | colony ) + ( FeLV - 1 | colony )`**" )
+
+IS.ranef_print$mod <- as.character( IS.ranef_print$mod )
+IS.ranef_print$mod[ match( names( ranefStructs ), IS.ranef_print$mod ) ] <- ranefStructs
+names( IS.ranef_print ) <- c( "Random effects", "AIC$_c$", "$\\Delta$AIC$_c$", "Akaike weight" )
+
+kable( x = IS.ranef_print, 
+       format = "pandoc", 
+       digits = 3, 
+       caption = "AIC$_c$ model selection table for selecting the best random-effects structure (conditional on the model set) in a generalized linear mixed-effects model of *Toxoplasma* infection status among feral domestic cats." )
+
+```
+
+#####<u>Antibody titer</u>
+
+```{r TranefSelect, echo = FALSE, message = FALSE, warning = FALSE}
+
+Titer.ranef_print <- Titer.ranef_selection
+
+row.names( Titer.ranef_print ) <- NULL
+
+ranefStructs <- c( int = "**`( 1 | colony )`**", 
+                   Jday = "**`( Jday - 1 | colony )`**", 
+                   Jday_int = "**`( 1 | colony ) + ( Jday - 1 | colony )`**", 
+                   fiv = "**`( FIV - 1 | colony )`**", 
+                   felv = "**`( FeLV - 1 | colony )`**" )
+
+Titer.ranef_print$mod <- as.character( Titer.ranef_print$mod )
+Titer.ranef_print$mod[ match( names( ranefStructs ), Titer.ranef_print$mod ) ] <- ranefStructs
+names( Titer.ranef_print ) <- c( "Random effects", "AIC$_c$", "$\\Delta$AIC$_c$", "Akaike weight" )
+
+kable( x = Titer.ranef_print, 
+       format = "pandoc", 
+       digits = 3, 
+       caption = "AIC$_c$ model selection table for selecting the best random-effects structure (conditional on the model set) in a linear mixed-effects model of anti-*T. gondii* IgG antibody titer among feral domestic cats." )
+
+
+```
+
+####*Model validation*
+
+#####<u>Infection status</u>
+
+```{r ISintValidatR, echo = FALSE, message = FALSE, warning = FALSE, out.width = "75%", fig.asp = 1/3, fig.align = "center", fig.cap = "Residual plots for a generalized linear (binomial) mixed-effects model of *Toxoplasma* infection status of feral cats. A colony identifier is included as a random effect on the intercept and on the slope of the `age` effect. **A**: randomized quantile residuals vs. fitted values, **B**: quantile-quantile plot of randomized quantile residuals, **C**: scale-location plot."}
+
+IS.int <- IS.ranef_cs.plus.nlminb[[ "age.int" ]]
+IS.int_test <- augment( IS.int ) %>% 
+  mutate( Jday = Jday * sd( cats.complete$Jday ) + mean( cats.complete$Jday ), 
+          catsincolony = catsincolony* sd( cats.complete$catsincolony ) + mean( cats.complete$catsincolony ) )
+IS.int_test$.qres <- qres2( IS.int )
+# IS.int_test$.hat <- hatvalues( IS.int )
+# ests <- influence( IS.int, group = "fcolony" )
+# IS.int_test$.cooksd <- cooks.distance( ests )
+
+rVf_IS.int <- ggplot( data = IS.int_test, 
+                      aes( x = .fitted, 
+                           y = .qres ) ) + 
+  geom_smooth( colour = "seashell4" ) + 
+  geom_hline( yintercept = 0, 
+              linetype = "dashed" ) + 
+  geom_point( alpha = 0.4 ) + 
+  theme_classic() + 
+  labs( x = "Fitted values", 
+        y = "Randomized quantile residuals" )
+
+y <- quantile( x = IS.int_test$.qres, probs = c( 0.25, 0.75 ) )
+x <- qnorm( p = c( 0.25, 0.75 ) )
+slope <- diff( y ) / diff( x )
+int <- y[ 1L ] - ( slope * x[ 1L ] )
+
+qq_IS.int <- ggplot( data = IS.int_test, 
+                     aes( sample = .qres ) ) + 
+  geom_abline( slope = slope, 
+               intercept = int, 
+               colour = "tomato" ) + 
+  stat_qq( alpha = 0.4 ) + 
+  theme_classic() + 
+  labs( x = "Theoretical quantiles", 
+        y = "Randomized quantile residuals" )
+
+sl_IS.int <- ggplot( data = IS.int_test, 
+                     aes( x = .fitted, 
+                          y = sqrt( abs( .qres ) ) ) ) + 
+  geom_smooth( colour = "seashell4" ) + 
+  geom_point( alpha = 0.4 ) + 
+  theme_classic() + 
+  labs( x = "Fitted values", 
+        y = "√|Randomized quantile residuals|" )
+
+# lev_IS.int <- ggplot( data = IS.int_test, 
+#                       aes( x = .hat, 
+#                            y = .qres, 
+#                            size = .cooksd ) ) + 
+#   geom_hline( yintercept = 0, 
+#               size = 1, 
+#               colour = "grey" ) + 
+#   geom_vline( xintercept = 0, 
+#               size = 1, 
+#               colour = "grey" ) + 
+#   geom_smooth( colour = "goldenrod", 
+#                se.fit = FALSE ) + 
+#   geom_point( alpha = 0.4 ) + 
+#   theme_classic() + 
+#   labs( x = "Leverage", 
+#         y = "Randomized quantile residuals", 
+#         size = "Cook's distance" ) + 
+#   theme( legend.position = "bottom" )
+
+plot_grid( rVf_IS.int, qq_IS.int, sl_IS.int, nrow = 1, labels = "AUTO" )
+
+```
+
+```{r ISageValidatR, echo = FALSE, message = FALSE, warning = FALSE, out.width = "75%", fig.asp = 1/3, fig.align = "center", fig.cap = "Residual plots for a generalized linear (binomial) mixed-effects model of *Toxoplasma* infection status of feral cats. A colony identifier is included as a random effect on the slope of the `age` effect. **A**: randomized quantile residuals vs. fitted values, **B**: quantile-quantile plot of randomized quantile residuals, **C**: scale-location plot."}
+
+IS.age <- IS.ranef_cs.plus.nlminb[[ "age" ]]
+IS.age_test <- augment( IS.age ) %>% 
+  mutate( Jday = Jday * sd( cats.complete$Jday ) + mean( cats.complete$Jday ), 
+          catsincolony = catsincolony* sd( cats.complete$catsincolony ) + mean( cats.complete$catsincolony ) )
+IS.age_test$.qres <- qres2( IS.age )
+# IS.age_test$.hat <- hatvalues( IS.age )
+# ests <- influence( IS.age, group = "fcolony" )
+# IS.age_test$.cooksd <- cooks.distance( ests )
+
+rVf_IS.age <- ggplot( data = IS.age_test, 
+                      aes( x = .fitted, 
+                           y = .qres ) ) + 
+  geom_smooth( colour = "seashell4" ) + 
+  geom_hline( yintercept = 0, 
+              linetype = "dashed" ) + 
+  geom_point( alpha = 0.4 ) + 
+  theme_classic() + 
+  labs( x = "Fitted values", 
+        y = "Randomized quantile residuals" )
+
+y <- quantile( x = IS.age_test$.qres, probs = c( 0.25, 0.75 ) )
+x <- qnorm( p = c( 0.25, 0.75 ) )
+slope <- diff( y ) / diff( x )
+int <- y[ 1L ] - ( slope * x[ 1L ] )
+
+qq_IS.age <- ggplot( data = IS.age_test, 
+                     aes( sample = .qres ) ) + 
+  geom_abline( slope = slope, 
+               intercept = int, 
+               colour = "tomato" ) + 
+  stat_qq( alpha = 0.4 ) + 
+  theme_classic() + 
+  labs( x = "Theoretical quantiles", 
+        y = "Randomized quantile residuals" )
+
+sl_IS.age <- ggplot( data = IS.age_test, 
+                     aes( x = .fitted, 
+                          y = sqrt( abs( .qres ) ) ) ) + 
+  geom_smooth( colour = "seashell4" ) + 
+  geom_point( alpha = 0.4 ) + 
+  theme_classic() + 
+  labs( x = "Fitted values", 
+        y = "√|Randomized quantile residuals|" )
+
+# lev_IS.int <- ggplot( data = IS.int_test, 
+#                       aes( x = .hat, 
+#                            y = .qres, 
+#                            size = .cooksd ) ) + 
+#   geom_hline( yintercept = 0, 
+#               size = 1, 
+#               colour = "grey" ) + 
+#   geom_vline( xintercept = 0, 
+#               size = 1, 
+#               colour = "grey" ) + 
+#   geom_smooth( colour = "goldenrod", 
+#                se.fit = FALSE ) + 
+#   geom_point( alpha = 0.4 ) + 
+#   theme_classic() + 
+#   labs( x = "Leverage", 
+#         y = "Randomized quantile residuals", 
+#         size = "Cook's distance" ) + 
+#   theme( legend.position = "bottom" )
+
+plot_grid( rVf_IS.age, qq_IS.age, sl_IS.age, nrow = 1, labels = "AUTO" )
+
+```
+
+```{r ISintCheck, echo = FALSE, message = FALSE, warning = FALSE, out.width = "50%", fig.asp = 4, fig.align = "center", fig.cap = "Model residuals against individual explanatory variables for a generalized linear (binomial) mixed-effects model of *Toxoplasma* infection status in feral cats. The model includes a random effect of colony ID on the intercept and the effect of `age`."}
+
+rVjday_IS.int <- ggplot( data = IS.int_test, 
+                         aes( x = Jday, 
+                              y = .qres ) ) + 
+  geom_point( colour = "skyblue4", 
+              alpha = 0.6 ) + 
+  theme_classic() + 
+  labs( x = "Julian date", 
+        y = "Randomized quantile residuals" )
+
+rVcats_IS.int <- ggplot( data = IS.int_test, 
+                         aes( x = catsincolony, 
+                              y = .qres ) ) + 
+  geom_point( colour = "indianred4", 
+              alpha = 0.6 ) + 
+  theme_classic() + 
+  labs( x = "Number of cats sampled from colony", 
+        y = "" )
+
+rVage_IS.int <- ggplot( data = IS.int_test, 
+                        aes( x = age.2, 
+                             y = .qres ) ) + 
+  geom_boxplot( colour = "grey30", 
+                fill = "darkolivegreen4" ) + 
+  theme_classic() + 
+  labs( x = "Age", 
+        y = "Randomized quantile residuals" ) + 
+  scale_x_discrete( labels = c( "Juvenile", "Adult" ) )
+
+rVsex_IS.int <- ggplot( data = IS.int_test, 
+                        aes( x = sex, 
+                             y = .qres ) ) + 
+  geom_boxplot( colour = "grey30", 
+                fill = "goldenrod2" ) + 
+  theme_classic() + 
+  labs( x = "Sex", 
+        y = "" ) + 
+  scale_x_discrete( labels = c( "Female", "Male" ) )
+
+rVseason_IS.int <- ggplot( data = IS.int_test, 
+                           aes( x = season, 
+                                y = .qres ) ) + 
+  geom_boxplot( colour = "grey30", 
+                fill = "cornflowerblue" ) + 
+  theme_classic() + 
+  labs( x = "Season", 
+        y = "Randomized quantile residuals" ) + 
+  scale_x_discrete( labels = c( "Dry", "Wet" ) )
+
+rVfiv_IS.int <- ggplot( data = IS.int_test, 
+                        aes( x = as.factor( fiv ), 
+                             y = .qres ) ) + 
+  geom_boxplot( colour = "grey30", 
+                fill = "tomato2" ) + 
+  theme_classic() + 
+  labs( x = "FIV exposure", 
+        y = "Randomized quantile residuals" ) + 
+  scale_x_discrete( labels = c( "Negative", "Positive" ) )
+
+rVfelv_IS.int <- ggplot( data = IS.int_test, 
+                         aes( x = as.factor( felv ), 
+                              y = .qres ) ) + 
+  geom_boxplot( colour = "grey30", 
+                fill = "navajowhite" ) + 
+  theme_classic() + 
+  labs( x = "FeLV exposure", 
+        y = "" ) + 
+  scale_x_discrete( labels = c( "Negative", "Positive" ) )
+
+plot_grid( rVjday_IS.int, rVcats_IS.int, 
+           rVage_IS.int, rVsex_IS.int, 
+           rVfiv_IS.int, rVfelv_IS.int, 
+           rVseason_IS.int, nrow = 4, labels = "AUTO" )
+
+```
+
+```{r ISageCheck, echo = FALSE, message = FALSE, warning = FALSE, out.width = "50%", fig.asp = 4, fig.align = "center", fig.cap = "Model residuals against individual explanatory variables for a generalized linear (binomial) mixed-effects model of *Toxoplasma* infection status in feral cats. The model includes a random effect of colony ID on the `age` effect only."}
+
+rVjday_IS.age <- ggplot( data = IS.age_test, 
+                         aes( x = Jday, 
+                              y = .qres ) ) + 
+  geom_point( colour = "skyblue4", 
+              alpha = 0.6 ) + 
+  theme_classic() + 
+  labs( x = "Julian date", 
+        y = "Randomized quantile residuals" )
+
+rVcats_IS.age <- ggplot( data = IS.age_test, 
+                         aes( x = catsincolony, 
+                              y = .qres ) ) + 
+  geom_point( colour = "indianred4", 
+              alpha = 0.6 ) + 
+  theme_classic() + 
+  labs( x = "Number of cats sampled from colony", 
+        y = "" )
+
+rVage_IS.age <- ggplot( data = IS.age_test, 
+                        aes( x = age.2, 
+                             y = .qres ) ) + 
+  geom_boxplot( colour = "grey30", 
+                fill = "darkolivegreen4" ) + 
+  theme_classic() + 
+  labs( x = "Age", 
+        y = "Randomized quantile residuals" ) + 
+  scale_x_discrete( labels = c( "Juvenile", "Adult" ) )
+
+rVsex_IS.age <- ggplot( data = IS.age_test, 
+                        aes( x = sex, 
+                             y = .qres ) ) + 
+  geom_boxplot( colour = "grey30", 
+                fill = "goldenrod2" ) + 
+  theme_classic() + 
+  labs( x = "Sex", 
+        y = "" ) + 
+  scale_x_discrete( labels = c( "Female", "Male" ) )
+
+rVseason_IS.age <- ggplot( data = IS.age_test, 
+                           aes( x = season, 
+                                y = .qres ) ) + 
+  geom_boxplot( colour = "grey30", 
+                fill = "cornflowerblue" ) + 
+  theme_classic() + 
+  labs( x = "Season", 
+        y = "Randomized quantile residuals" ) + 
+  scale_x_discrete( labels = c( "Dry", "Wet" ) )
+
+rVfiv_IS.age <- ggplot( data = IS.age_test, 
+                        aes( x = as.factor( fiv ), 
+                             y = .qres ) ) + 
+  geom_boxplot( colour = "grey30", 
+                fill = "tomato2" ) + 
+  theme_classic() + 
+  labs( x = "FIV exposure", 
+        y = "Randomized quantile residuals" ) + 
+  scale_x_discrete( labels = c( "Negative", "Positive" ) )
+
+rVfelv_IS.age <- ggplot( data = IS.age_test, 
+                         aes( x = as.factor( felv ), 
+                              y = .qres ) ) + 
+  geom_boxplot( colour = "grey30", 
+                fill = "navajowhite" ) + 
+  theme_classic() + 
+  labs( x = "FeLV exposure", 
+        y = "" ) + 
+  scale_x_discrete( labels = c( "Negative", "Positive" ) )
+
+plot_grid( rVjday_IS.age, rVcats_IS.age, 
+           rVage_IS.age, rVsex_IS.age, 
+           rVfiv_IS.age, rVfelv_IS.age, 
+           rVseason_IS.age, nrow = 4, labels = "AUTO" )
+```
+
+```{r ISintFvO, echo = FALSE, message = FALSE, warning = FALSE, out.width = "30%", fig.asp = 1, fig.align = "center", fig.cap = "Model-fitted expectation for *Toxoplasma* infection status vs. true status for feral cats. The model expectations are generated by a generalized (binomial) linear mixed-effects model, with a random effect of colony ID on the intercept and the effect of `age`."}
+
+fVo_IS.int <- ggplot( data = IS.int_test, 
+                      aes( x = as.factor( toxo160 ), 
+                           y = .mu ) ) + 
+  geom_boxplot( colour = "grey30", 
+                fill = "firebrick1" ) + 
+  theme_classic() + 
+  labs( x = "*Toxoplasma* infection status", 
+        y = "Fitted values" )
+
+fVo_IS.int
+
+```
+
+```{r ISageFvO, echo = FALSE, message = FALSE, warning = FALSE, out.width = "30%", fig.asp = 1, fig.align = "center", fig.cap = "Model-fitted expectation for *Toxoplasma* infection status vs. true status for feral cats. The model expectations are generated by a generalized (binomial) linear mixed-effects model, with a random effect of colony ID on the effect of `age` only."}
+
+fVo_IS.age <- ggplot( data = IS.age_test, 
+                      aes( x = as.factor( toxo160 ), 
+                           y = .mu ) ) + 
+  geom_boxplot( colour = "grey30", 
+                fill = "firebrick1" ) + 
+  theme_classic() + 
+  labs( x = "*Toxoplasma* infection status", 
+        y = "Fitted values" )
+
+fVo_IS.age
+
+```
+
+#####<u>Antibody titer</u>
+
+```{r TintValidatR, echo = FALSE, message = FALSE, warning = FALSE, out.width = "60%", fig.asp = 1, fig.align = "center", fig.cap = "Residual plots for a linear mixed-effects models of log-transformed anti-*Toxoplasma gondii* IgG antibody titer in feral cats. **A**: randomized quantile residuals vs. fitted values, **B**: quantile-quantile plot of randomized quantile residuals, **C**: scale-location plot, **D**: residual-leverage plot."}
+
+Titer.int <- Titer.ranef[[ "int" ]]
+Titer.int_test <- augment( Titer.int )
+Titer.int_test$.hat <- hatvalues( Titer.int )
+ests <- influence( Titer.int, obs = TRUE )
+Titer.int_test$.cooksd <- cooks.distance( ests )
+
+rVf_Titer.int <- ggplot( data = Titer.int_test, 
+                         aes( x = .fitted, 
+                              y = .resid ) ) + 
+  geom_smooth( colour = "seashell4" ) + 
+  geom_hline( yintercept = 0, 
+              linetype = "dashed" ) + 
+  geom_point( alpha = 0.4 ) + 
+  theme_classic() + 
+  labs( x = "Fitted values", 
+        y = "Residuals" )
+
+y <- quantile( x = Titer.int_test$.resid, probs = c( 0.25, 0.75 ) )
+x <- qnorm( p = c( 0.25, 0.75 ) )
+slope <- diff( y ) / diff( x )
+int <- y[ 1L ] - ( slope * x[ 1L ] )
+
+qq_Titer.int <- ggplot( data = Titer.int_test, 
+                        aes( sample = .resid ) ) + 
+  geom_abline( slope = slope, 
+               intercept = int, 
+               colour = "tomato" ) + 
+  stat_qq( alpha = 0.4 ) + 
+  theme_classic() + 
+  labs( x = "Theoretical quantiles", 
+        y = "Residuals" )
+
+sl_Titer.int <- ggplot( data = Titer.int_test, 
+                        aes( x = .fitted, 
+                             y = sqrt( abs( .resid ) ) ) ) + 
+  geom_smooth( colour = "seashell4" ) + 
+  geom_point( alpha = 0.4 ) + 
+  theme_classic() + 
+  labs( x = "Fitted values", 
+        y = "√|Residuals|" )
+
+lev_Titer.int <- ggplot( data = Titer.int_test,
+                         aes( x = .hat,
+                              y = .resid,
+                              size = .cooksd ) ) +
+  geom_hline( yintercept = 0,
+              size = 1,
+              colour = "grey" ) +
+  geom_vline( xintercept = 0,
+              size = 1,
+              colour = "grey" ) +
+  geom_point() +
+  theme_classic() +
+  labs( x = "Leverage",
+        y = "Residuals",
+        size = "Cook's distance" ) +
+  theme( legend.position = "bottom" )
+
+plot_grid( rVf_Titer.int, qq_Titer.int, sl_Titer.int, lev_Titer.int, nrow = 2, labels = "AUTO" )
+
+```
+
+```{r TJdayValidatR, echo = FALSE, message = FALSE, warning = FALSE, out.width = "60%", fig.asp = 1, fig.align = "center", fig.cap = "Residual plots for a linear mixed-effects models of log-transformed anti-*Toxoplasma gondii* IgG antibody titer in feral cats as a function of FeLV infection status and Julian date, with a random effect of the colony of origin on the slope of Julian date [but not on the intercept]). **A**: randomized quantile residuals vs. fitted values, **B**: quantile-quantile plot of randomized quantile residuals, **C**: scale-location plot, **D**: residual-leverage plot."}
+
+Titer.Jday <- Titer.ranef[[ "Jday" ]]
+Titer.Jday_test <- augment( Titer.Jday )
+Titer.Jday_test$.hat <- hatvalues( Titer.Jday )
+ests <- influence( Titer.Jday, obs = TRUE )
+Titer.Jday_test$.cooksd <- cooks.distance( ests )
+
+rVf_Titer.Jday <- ggplot( data = Titer.Jday_test, 
+                          aes( x = .fitted, 
+                               y = .resid ) ) + 
+  geom_smooth( colour = "seashell4" ) + 
+  geom_hline( yintercept = 0, 
+              linetype = "dashed" ) + 
+  geom_point( alpha = 0.4 ) + 
+  theme_classic() + 
+  labs( x = "Fitted values", 
+        y = "Randomized quantile residuals" )
+
+y <- quantile( x = Titer.Jday_test$.resid, probs = c( 0.25, 0.75 ) )
+x <- qnorm( p = c( 0.25, 0.75 ) )
+slope <- diff( y ) / diff( x )
+int <- y[ 1L ] - ( slope * x[ 1L ] )
+
+qq_Titer.Jday <- ggplot( data = Titer.Jday_test, 
+                         aes( sample = .resid ) ) + 
+  geom_abline( slope = slope, 
+               intercept = int, 
+               colour = "tomato" ) + 
+  stat_qq( alpha = 0.4 ) + 
+  theme_classic() + 
+  labs( x = "Theoretical quantiles", 
+        y = "Randomized quantie residuals" )
+
+sl_Titer.Jday <- ggplot( data = Titer.Jday_test, 
+                         aes( x = .fitted, 
+                              y = sqrt( abs( .resid ) ) ) ) + 
+  geom_smooth( colour = "seashell4" ) + 
+  geom_point( alpha = 0.4 ) + 
+  theme_classic() + 
+  labs( x = "Fitted values", 
+        y = "√|Randomized quantile residuals|" )
+
+lev_Titer.Jday <- ggplot( data = Titer.Jday_test,
+                          aes( x = .hat,
+                               y = .resid,
+                               size = .cooksd ) ) +
+  geom_hline( yintercept = 0,
+              size = 1,
+              colour = "grey" ) +
+  geom_vline( xintercept = 0,
+              size = 1,
+              colour = "grey" ) +
+  geom_point() +
+  theme_classic() +
+  labs( x = "Leverage",
+        y = "Randomized quantile residuals",
+        size = "Cook's distance" ) +
+  theme( legend.position = "bottom" )
+
+
+plot_grid( rVf_Titer.Jday, qq_Titer.Jday, sl_Titer.Jday, lev_Titer.Jday, nrow = 2, labels = "AUTO" )
+
+```
+
+```{r TintCheck, echo = FALSE, message = FALSE, warning = FALSE, out.width = "50%", fig.asp = 4, fig.align = "center", fig.cap = "Model residuals against individual explanatory variables a linear mixed-effects model of log-transformed anti-*Toxoplasma gondii* IgG antibody titer in feral cats as a function of FeLV exposure, with a random effect of origin on the intercept."}
+
+rVjday_Titer.int <- ggplot( data = Titer.int_test, 
+                            aes( x = Jday, 
+                                 y = .resid ) ) + 
+  geom_point( colour = "skyblue4" ) + 
+  theme_classic() + 
+  labs( x = "Julian date", 
+        y = "Residuals" )
+
+rVcats_Titer.int <- ggplot( data = Titer.int_test, 
+                            aes( x = catsincolony, 
+                                 y = .resid ) ) + 
+  geom_point( colour = "indianred4" ) + 
+  theme_classic() + 
+  labs( x = "Number of cats sampled from colony", 
+        y = "" )
+
+rVage_Titer.int <- ggplot( data = Titer.int_test, 
+                           aes( x = age.2, 
+                                y = .resid ) ) + 
+  geom_boxplot( colour = "grey30", 
+                fill = "darkolivegreen4" ) + 
+  theme_classic() + 
+  labs( x = "Age", 
+        y = "Residuals" ) + 
+  scale_x_discrete( labels = c( "Juvenile", "Adult" ) )
+
+rVsex_Titer.int <- ggplot( data = Titer.int_test, 
+                           aes( x = sex, 
+                                y = .resid ) ) + 
+  geom_boxplot( colour = "grey30", 
+                fill = "goldenrod2" ) + 
+  theme_classic() + 
+  labs( x = "Sex", 
+        y = "" ) + 
+  scale_x_discrete( labels = c( "Female", "Male" ) )
+
+rVseason_Titer.int <- ggplot( data = Titer.int_test, 
+                              aes( x = season, 
+                                   y = .resid ) ) + 
+  geom_boxplot( colour = "grey30", 
+                fill = "cornflowerblue" ) + 
+  theme_classic() + 
+  labs( x = "Season", 
+        y = "Residuals" ) + 
+  scale_x_discrete( labels = c( "Dry", "Wet" ) )
+
+rVfiv_Titer.int <- ggplot( data = Titer.int_test, 
+                           aes( x = as.factor( fiv ), 
+                                y = .resid ) ) + 
+  geom_boxplot( colour = "grey30", 
+                fill = "tomato2" ) + 
+  theme_classic() + 
+  labs( x = "FIV exposure", 
+        y = "Residuals" ) + 
+  scale_x_discrete( labels = c( "Negative", "Positive" ) )
+
+rVfelv_Titer.int <- ggplot( data = Titer.int_test, 
+                            aes( x = as.factor( felv ), 
+                                 y = .resid ) ) + 
+  geom_boxplot( colour = "grey30", 
+                fill = "navajowhite" ) + 
+  theme_classic() + 
+  labs( x = "FeLV exposure", 
+        y = "" ) + 
+  scale_x_discrete( labels = c( "Negative", "Positive" ) )
+
+plot_grid( rVjday_Titer.int, rVcats_Titer.int, 
+           rVage_Titer.int, rVsex_Titer.int, 
+           rVfiv_Titer.int, rVfelv_Titer.int, 
+           rVseason_Titer.int, nrow = 4, labels = "AUTO" )
+
+```
+
+```{r TJdayCheck, echo = FALSE, message = FALSE, warning = FALSE, out.width = "50%", fig.asp = 4, fig.align = "center", fig.cap = "Model residuals against individual explanatory variables a linear mixed-effects model of log-transformed anti-*Toxoplasma gondii* IgG antibody titer in feral cats, with a random effect of origin on the slope of Julian date (but not on the intercept)."}
+
+rVjday_Titer.Jday <- ggplot( data = Titer.Jday_test, 
+                             aes( x = Jday, 
+                                  y = .resid ) ) + 
+  geom_point( colour = "skyblue4" ) + 
+  theme_classic() + 
+  labs( x = "Julian date", 
+        y = "Residuals" )
+
+rVcats_Titer.Jday <- ggplot( data = Titer.Jday_test, 
+                             aes( x = catsincolony, 
+                                  y = .resid ) ) + 
+  geom_point( colour = "indianred4" ) + 
+  theme_classic() + 
+  labs( x = "Number of cats sampled from colony", 
+        y = "" )
+
+rVage_Titer.Jday <- ggplot( data = Titer.Jday_test, 
+                            aes( x = age.2, 
+                                 y = .resid ) ) + 
+  geom_boxplot( colour = "grey30", 
+                fill = "darkolivegreen4" ) + 
+  theme_classic() + 
+  labs( x = "Age", 
+        y = "Residuals" ) + 
+  scale_x_discrete( labels = c( "Juvenile", "Adult" ) )
+
+rVsex_Titer.Jday <- ggplot( data = Titer.Jday_test, 
+                            aes( x = sex, 
+                                 y = .resid ) ) + 
+  geom_boxplot( colour = "grey30", 
+                fill = "goldenrod2" ) + 
+  theme_classic() + 
+  labs( x = "Sex", 
+        y = "" ) + 
+  scale_x_discrete( labels = c( "Female", "Male" ) )
+
+rVseason_Titer.Jday <- ggplot( data = Titer.Jday_test, 
+                               aes( x = season, 
+                                    y = .resid ) ) + 
+  geom_boxplot( colour = "grey30", 
+                fill = "cornflowerblue" ) + 
+  theme_classic() + 
+  labs( x = "Season", 
+        y = "Residuals" ) + 
+  scale_x_discrete( labels = c( "Dry", "Wet" ) )
+
+rVfiv_Titer.Jday <- ggplot( data = Titer.Jday_test, 
+                            aes( x = as.factor( fiv ), 
+                                 y = .resid ) ) + 
+  geom_boxplot( colour = "grey30", 
+                fill = "tomato2" ) + 
+  theme_classic() + 
+  labs( x = "FIV exposure", 
+        y = "Residuals" ) + 
+  scale_x_discrete( labels = c( "Negative", "Positive" ) )
+
+rVfelv_Titer.Jday <- ggplot( data = Titer.Jday_test, 
+                             aes( x = as.factor( felv ), 
+                                  y = .resid ) ) + 
+  geom_boxplot( colour = "grey30", 
+                fill = "navajowhite" ) + 
+  theme_classic() + 
+  labs( x = "FeLV exposure", 
+        y = "" ) + 
+  scale_x_discrete( labels = c( "Negative", "Positive" ) )
+
+plot_grid( rVjday_Titer.Jday, rVcats_Titer.Jday, 
+           rVage_Titer.Jday, rVsex_Titer.Jday, 
+           rVfiv_Titer.Jday, rVfelv_Titer.Jday, 
+           rVseason_Titer.Jday, nrow = 4, labels = "AUTO" )
+
+```
+
+```{r TintFvO, echo = FALSE, message = FALSE, warning = FALSE, out.width = "30%", fig.asp = 1, fig.align = "center", fig.cap = "Model-fitted expectation for anti-*Toxoplasma gondii* antibody titer vs. measured titer in feral cats. The model expectations are generated by a linear mixed-effects model, with a random effect of colony ID on the global intercept."}
+
+fVo_Titer.int <- ggplot( data = Titer.int_test, 
+                         aes( x = exp( ttoxo.titer ), 
+                              y = exp( .fitted ) ) ) + 
+  geom_abline( slope = 1, 
+               intercept = 0 ) + 
+  geom_point( colour = "firebrick1" ) + 
+  theme_classic() + 
+  labs( x = "Anti-*Toxoplasma* IgG antibody titer", 
+        y = "Fitted values" )
+
+fVo_Titer.int
+
+```
+
+```{r TJdayFvO, echo = FALSE, message = FALSE, warning = FALSE, out.width = "30%", fig.asp = 1, fig.align = "center", fig.cap = "Model-fitted expectation for anti-*Toxoplasma gondii* antibody titer vs. measured titer in feral cats. The model expectations are generated by a linear mixed-effects model, with a random effect of colony ID on the effect of Julian date (but not on the intercept)."}
+
+fVo_Titer.Jday <- ggplot( data = Titer.Jday_test, 
+                          aes( x = exp( ttoxo.titer ), 
+                               y = exp( .fitted ) ) ) + 
+  geom_abline( slope = 1, 
+               intercept = 0 ) + 
+  geom_point( colour = "firebrick1" ) + 
+  theme_classic() + 
+  labs( x = "Anti-*Toxoplasma* IgG antibody titer", 
+        y = "Fitted values" )
+
+fVo_Titer.Jday
+
+```
+
+###**C O D E** {#code}
+
+```{r ref.label = all_labels(), echo = TRUE, eval = FALSE}
+```
+
+###**R E F E R E N C E S** {#bibliography}
