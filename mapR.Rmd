@@ -1,0 +1,474 @@
+---
+title: "Cats of Monterey Bay, CA"
+date: "`r format( Sys.Date(), '%B %d, %Y' )`"
+output:
+  html_document:
+    theme: cosmo
+---
+
+```{r initializR, include = FALSE}
+
+knitr::opts_chunk$set( "echo" = FALSE, 
+                       "message" = FALSE, 
+                       "warning" = FALSE )
+
+```
+
+```{r pkgR}
+
+library( tidyverse )
+library( lubridate )
+library( leaflet )
+library( sp )
+
+```
+
+```{r impoRt}
+
+# Read in the raw data.
+cats <- read.csv( file = "data/coastalCAcats.csv", 
+                  header = TRUE, 
+                  sep = "," )
+
+# Consider only complete observations of feral (vs. wild) cats.
+cats.complete <- cats[ complete.cases( cats ), ]
+cats.complete <- cats.complete %>% 
+  filter( type == "managed" ) %>% 
+  dplyr::select( -type )
+
+
+# Teach R to recognize dates.
+cats.complete$date <- mdy( cats.complete$date )
+
+# Derive a variable for Julian date.
+cats.complete$Jday <- yday( x = cats.complete$date )
+
+# Homogenize titer levels.
+cats.complete$toxo.titer <- gsub( pattern = "<40", 
+                                  replacement = "20", 
+                                  x = cats.complete$toxo.titer )
+cats.complete$toxo.titer <- gsub( pattern = "[^0-9]", 
+                                  replacement = "", 
+                                  x = cats.complete$toxo.titer )
+
+# Correct likely errors in data entry. (Reviewed with E. VanWormer)
+cats.complete$toxo.titer[ which( cats.complete$toxo.titer == "5180" ) ] <- "5120"
+cats.complete$toxo.titer[ which( cats.complete$toxo.titer == "20240" ) ] <- "10240"
+
+# Convert titers to numeric values.
+cats.complete$toxo.titer <- as.numeric( cats.complete$toxo.titer )
+
+# Correct infection-positive responses for different titer levels.
+cats.complete$toxo40 <- ifelse( test = cats.complete$toxo.titer >= 40, 
+                                yes = 1, 
+                                no = 0 )
+cats.complete$toxo160 <- ifelse( test = cats.complete$toxo.titer >= 160, 
+                                 yes = 1, 
+                                 no = 0 )
+cats.complete$toxo320 <- ifelse( test = cats.complete$toxo.titer >= 320, 
+                                 yes = 1, 
+                                 no = 0 )
+
+# Order age covariates.
+cats.complete$age <- factor( x = cats.complete$age, 
+                             levels = c( "< 6 months", "6-12 months", "> 12 months" ), 
+                             ordered = TRUE )
+
+cats.complete$age.2 <- factor( x = cats.complete$age.2, 
+                               levels = c( "juvenile", "adult" ), 
+                               ordered = TRUE )
+
+# Data transformations
+cats.complete$otoxo.titer <- as.ordered( cats.complete$toxo.titer )
+cats.complete$fcolony <- as.factor( cats.complete$colony )
+
+# Extract subset of data for which clinical infection (as measured by toxo titer) has been established.
+cats.infect <- cats.complete[ which( as.logical( cats.complete$toxo160 ) ), ]
+
+# Extract colony size data for summarization.
+cats.colonies <- cats.complete %>% 
+  dplyr::select( contains( "colony" ), -colony ) %>% 
+  distinct()
+
+```
+
+###**C A T\ \ \ M A P !**
+
+```{r mapR}
+
+# Teach R to recognize longitude and latitude.
+catsLocs <- cats %>% dplyr::select( c( longitude, latitude ) )
+inds <- which( complete.cases( catsLocs ) )
+catsLocs <- catsLocs[ inds, ]
+
+# Re-create data as spatial.
+catsSPDF <- SpatialPointsDataFrame( coords = catsLocs, 
+                                    data = cats[ inds, ], 
+                                    proj4string = CRS( "+init=epsg:4326 +proj=longlat +ellps=WGS84 +datum=WGS84 +no_defs +towgs84=0,0,0" ) )
+
+
+# Make a color palette for infection status representation.
+pal <- colorFactor( c( "navy", "red" ), domain = c( 0, 1 ) )
+aPal <- colorFactor( c( "yellow", "orange", "red" ), domain = c( "< 6 months", "6-12 months", "> 12 months" ) )
+
+toxoMap <- leaflet( data = catsSPDF ) %>% 
+  addTiles() %>% 
+  addCircleMarkers( lng = ~longitude, 
+                    lat = ~latitude, 
+                    # clusterOptions = markerClusterOptions(), 
+                    radius = 7, 
+                    color = ~pal( toxo160 ), 
+                    stroke = FALSE, 
+                    fillOpacity = 0.3 )
+
+toxoMap
+
+```
+
+Each point is an individual cat, color-coded blue for *Toxoplasma*-negative cats (titer <1:160) and red for positive exposure status.
+
+You can also do something with clusters, like this:
+
+```{r clustR}
+
+clusterCat <- leaflet( data = catsSPDF ) %>% 
+  addTiles() %>% 
+  addCircleMarkers( lng = ~longitude, 
+                    lat = ~latitude, 
+                    clusterOptions = markerClusterOptions(), 
+                    radius = 7, 
+                    color = ~pal( toxo160 ), 
+                    stroke = FALSE, 
+                    fillOpacity = 0.3 )
+
+clusterCat
+
+```
+
+Zooming and panning in this is pretty neat. I'd like to figure out a way to control color, etc. (for instance, coloring on a continuous gradient based on proportion infected, average titer, or some other metric), but I haven't really dug into that yet.
+
+-----
+
+###**C O L O N Y\ \ \ M A P !**
+
+```{r colonyMapR}
+
+colonies <- cats %>%
+  group_by( colony ) %>%
+  summarize( size = n(),
+             toxo = sum( toxo160 ) * 100 / n(),
+             latitude = mean( latitude ),
+             longitude = mean( longitude ) )
+colonies <- colonies[ complete.cases( colonies ), ]
+
+coloniesLocs <- colonies %>% dplyr::select( c( longitude, latitude ) )
+
+coloniesSPDF <- SpatialPointsDataFrame( coords = coloniesLocs,
+                                        data = colonies,
+                                        proj4string = CRS( "+init=epsg:4326 +proj=longlat +ellps=WGS84 +datum=WGS84 +no_defs +towgs84=0,0,0" ) )
+
+qpal <- colorNumeric( palette = "YlOrRd", domain = coloniesSPDF$toxo )
+
+colonyMap <- leaflet( data = coloniesSPDF ) %>%
+  addTiles() %>%
+  addCircleMarkers( lng = ~longitude,
+                    lat = ~latitude,
+                    radius = ~size,
+                    color = ~qpal( toxo ),
+                    stroke = FALSE,
+                    label = ~paste( colony ), 
+                    labelOptions = labelOptions( noHide = TRUE, 
+                                                 textOnly = TRUE ), 
+                    fillOpacity = 1 )
+
+colonyMap
+
+```
+
+Here's another map looking at colonies only. The size of the marker corresponds to the number of cats tested from the colony, and the color on the yellow--orange--red palette indicates the proportion with a history of exposure to *Toxoplasma*.
+
+-----
+
+###**E X P L O R E !**
+
+**n** = `r nrow(cats)` cats.
+
+####***Toxoplasma***
+
+```{r toxo160}
+
+toxoMap
+
+```
+
+Let's first revisit cases of toxoplasmosis. Red points are *Toxoplasma*-positive cats (titer ≥1:160; **n** = `r sum(cats$toxo160,na.rm=TRUE)`).
+
+####**FIV**
+
+```{r fiv}
+
+fivMap <- leaflet( data = catsSPDF ) %>% 
+  addTiles() %>% 
+  addCircleMarkers( lng = ~longitude, 
+                    lat = ~latitude, 
+                    # clusterOptions = markerClusterOptions(), 
+                    radius = 7, 
+                    color = ~pal( fiv ), 
+                    stroke = FALSE, 
+                    fillOpacity = 0.3 )
+
+fivMap
+
+```
+
+Okay. Now here's a look at FIV exposure (**n** = `r sum(cats$fiv,na.rm=TRUE)`).
+
+####**FeLV**
+
+```{r felv}
+
+felvMap <- leaflet( data = catsSPDF ) %>% 
+  addTiles() %>% 
+  addCircleMarkers( lng = ~longitude, 
+                    lat = ~latitude, 
+                    # clusterOptions = markerClusterOptions(), 
+                    radius = 7, 
+                    color = ~pal( felv ), 
+                    stroke = FALSE, 
+                    fillOpacity = 0.3 )
+
+felvMap
+
+```
+
+And FeLV infection (**n** = `r sum(cats$felv,na.rm=TRUE)`).
+
+Now on to coinfections.
+
+####**FIV--FeLV**
+
+```{r fivfelv}
+
+# Make a color palette for infection status representation.
+palCo <- colorFactor( c( "navy", "navy", "navy", "red" ), domain = c( "0.0", "0.1", "1.0",  "1.1" ) )
+
+fiv.felvMap <- leaflet( data = catsSPDF ) %>% 
+  addTiles() %>% 
+  addCircleMarkers( lng = ~longitude, 
+                    lat = ~latitude, 
+                    # clusterOptions = markerClusterOptions(), 
+                    radius = 7, 
+                    color = ~palCo( interaction( fiv, felv ) ), 
+                    stroke = FALSE, 
+                    fillOpacity = 0.3 )
+
+fiv.felvMap
+
+```
+
+FIV--FeLV coexposure/infection (**n** = `r sum(cats$fiv==1&cats$felv==1,na.rm=TRUE)`).
+
+####**FIV--_Toxoplasma_**
+
+```{r fivtoxo}
+
+fiv.toxoMap <- leaflet( data = catsSPDF ) %>% 
+  addTiles() %>% 
+  addCircleMarkers( lng = ~longitude, 
+                    lat = ~latitude, 
+                    # clusterOptions = markerClusterOptions(), 
+                    radius = 7, 
+                    color = ~palCo( interaction( fiv, toxo160 ) ), 
+                    stroke = FALSE, 
+                    fillOpacity = 0.3 )
+
+fiv.toxoMap
+
+```
+
+FIV--*Toxoplasma* coexposure (**n** = `r sum(cats$fiv==1&cats$toxo160==1,na.rm=TRUE)`).
+
+####**FeLV--_Toxoplasma_**
+
+```{r felvtoxo}
+
+felv.toxoMap <- leaflet( data = catsSPDF ) %>% 
+  addTiles() %>% 
+  addCircleMarkers( lng = ~longitude, 
+                    lat = ~latitude, 
+                    # clusterOptions = markerClusterOptions(), 
+                    radius = 7, 
+                    color = ~palCo( interaction( felv, toxo160 ) ), 
+                    stroke = FALSE, 
+                    fillOpacity = 0.3 )
+
+felv.toxoMap
+
+```
+
+FIV--*Toxoplasma* coexposure (**n** = `r sum(cats$felv==1&cats$toxo160==1,na.rm=TRUE)`).
+
+####**FIV--FeLV--_Toxoplasma_**
+
+```{r fivfelvtoxo}
+
+# Make a color palette for infection status representation.
+palCo2 <- colorFactor( c( "navy", "navy", "navy", "navy", "navy", "navy", "navy", "red" ), domain = c( "0.0.0", "0.0.1", "0.1.0", "0.1.1", "1.0.0", "1.0.1", "1.1.0", "1.1.1"  ) )
+
+
+fiv.felv.toxoMap <- leaflet( data = catsSPDF ) %>% 
+  addTiles() %>% 
+  addCircleMarkers( lng = ~longitude, 
+                    lat = ~latitude, 
+                    # clusterOptions = markerClusterOptions(), 
+                    radius = 7, 
+                    color = ~palCo2( interaction( fiv, felv, toxo160 ) ), 
+                    stroke = FALSE, 
+                    fillOpacity = 0.3 )
+
+fiv.felv.toxoMap
+
+```
+
+FIV--*Toxoplasma* coexposure (**n** = `r sum(cats$fiv==1&cats$felv==1&cats$toxo160==1,na.rm=TRUE)`).
+
+Those maps are pretty crowded by negative cases. Let's eliminate those...
+
+####***Toxoplasma***
+
+```{r toxo160}
+
+toxoMap %>% addCircleMarkers( color = "red" )
+
+```
+
+Let's first revisit cases of toxoplasmosis. Red points are *Toxoplasma*-positive cats (titer ≥1:160; **n** = `r sum(cats$toxo160,na.rm=TRUE)`).
+
+####**FIV**
+
+```{r fiv}
+
+fivMap <- leaflet( data = filter( catsSPDF, fiv == 1 ) ) %>% 
+  addTiles() %>% 
+  addCircleMarkers( lng = ~longitude, 
+                    lat = ~latitude, 
+                    # clusterOptions = markerClusterOptions(), 
+                    radius = 7, 
+                    color = ~pal( fiv ), 
+                    stroke = FALSE, 
+                    fillOpacity = 0.3 )
+
+fivMap
+
+```
+
+Okay. Now here's a look at FIV exposure (**n** = `r sum(cats$fiv,na.rm=TRUE)`).
+
+####**FeLV**
+
+```{r felv}
+
+felvMap <- leaflet( data = catsSPDF ) %>% 
+  addTiles() %>% 
+  addCircleMarkers( lng = ~longitude, 
+                    lat = ~latitude, 
+                    # clusterOptions = markerClusterOptions(), 
+                    radius = 7, 
+                    color = ~pal( felv ), 
+                    stroke = FALSE, 
+                    fillOpacity = 0.7 )
+
+felvMap
+
+```
+
+And FeLV infection (**n** = `r sum(cats$felv,na.rm=TRUE)`).
+
+Now on to coinfections.
+
+####**FIV--FeLV**
+
+```{r fivfelv}
+
+# Make a color palette for infection status representation.
+palCo <- colorFactor( c( "transparent", "transparent", "transparent", "red" ), domain = c( "0.0", "0.1", "1.0",  "1.1" ) )
+
+fiv.felvMap <- leaflet( data = catsSPDF ) %>% 
+  addTiles() %>% 
+  addCircleMarkers( lng = ~longitude, 
+                    lat = ~latitude, 
+                    # clusterOptions = markerClusterOptions(), 
+                    radius = 7, 
+                    color = ~palCo( interaction( fiv, felv ) ), 
+                    stroke = FALSE, 
+                    fillOpacity = 1 )
+
+fiv.felvMap
+
+```
+
+FIV--FeLV coexposure/infection (**n** = `r sum(cats$fiv==1&cats$felv==1,na.rm=TRUE)`).
+
+####**FIV--_Toxoplasma_**
+
+```{r fivtoxo}
+
+fiv.toxoMap <- leaflet( data = catsSPDF ) %>% 
+  addTiles() %>% 
+  addCircleMarkers( lng = ~longitude, 
+                    lat = ~latitude, 
+                    # clusterOptions = markerClusterOptions(), 
+                    radius = 7, 
+                    color = ~palCo( interaction( fiv, toxo160 ) ), 
+                    stroke = FALSE, 
+                    fillOpacity = 0.3 )
+
+fiv.toxoMap
+
+```
+
+FIV--*Toxoplasma* coexposure (**n** = `r sum(cats$fiv==1&cats$toxo160==1,na.rm=TRUE)`).
+
+####**FeLV--_Toxoplasma_**
+
+```{r felvtoxo}
+
+felv.toxoMap <- leaflet( data = catsSPDF ) %>% 
+  addTiles() %>% 
+  addCircleMarkers( lng = ~longitude, 
+                    lat = ~latitude, 
+                    # clusterOptions = markerClusterOptions(), 
+                    radius = 7, 
+                    color = ~palCo( interaction( felv, toxo160 ) ), 
+                    stroke = FALSE, 
+                    fillOpacity = 0.3 )
+
+felv.toxoMap
+
+```
+
+FIV--*Toxoplasma* coexposure (**n** = `r sum(cats$felv==1&cats$toxo160==1,na.rm=TRUE)`).
+
+####**FIV--FeLV--_Toxoplasma_**
+
+```{r fivfelvtoxo}
+
+# Make a color palette for infection status representation.
+palCo2 <- colorFactor( c( "navy", "navy", "navy", "navy", "navy", "navy", "navy", "red" ), domain = c( "0.0.0", "0.0.1", "0.1.0", "0.1.1", "1.0.0", "1.0.1", "1.1.0", "1.1.1"  ) )
+
+
+fiv.felv.toxoMap <- leaflet( data = catsSPDF ) %>% 
+  addTiles() %>% 
+  addCircleMarkers( lng = ~longitude, 
+                    lat = ~latitude, 
+                    # clusterOptions = markerClusterOptions(), 
+                    radius = 7, 
+                    color = ~palCo2( interaction( fiv, felv, toxo160 ) ), 
+                    stroke = FALSE, 
+                    fillOpacity = 0.3 )
+
+fiv.felv.toxoMap
+
+```
+
+FIV--*Toxoplasma* coexposure (**n** = `r sum(cats$fiv==1&cats$felv==1&cats$toxo160==1,na.rm=TRUE)`).
